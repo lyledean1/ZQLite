@@ -1,5 +1,6 @@
 const std = @import("std");
 const parser = @import("tokenizer.zig");
+const sql = @import("db.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -19,4 +20,7 @@ pub fn main() !void {
     for (tokens.items) |str| {
         std.debug.print("{s}\n", .{str.value});
     }
+
+    var db = try sql.Db.init("db/test.db");
+    defer db.deinit();
 }
