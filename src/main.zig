@@ -24,5 +24,6 @@ pub fn main() !void {
     var db = try sql.Db.open(file);
     try db.readInfo();
     try db.printDbInfo(std.io.getStdOut().writer());
+    try db.readPage(allocator);
     defer db.deinit();
 }

@@ -63,6 +63,15 @@ pub const Db = struct {
         self.info = try readDbInfo(self);
     }
 
+    pub fn readPage(self: *Db, allocator: std.mem.Allocator) !void {
+        // Seek to second page (4096 bytes)
+        try self.file.seekTo(4096);
+
+        var page: [4096]u8 = undefined;
+        _ = try self.file.readAll(&page);
+        try walkLeafPage(allocator, &page);
+    }
+
     pub fn printDbInfo(self: *Db, writer: anytype) !void {
         const info = self.info orelse return error.NoDbInfo;
 
@@ -189,3 +198,217 @@ pub const TableRecord = {};
 pub const TableRawRecord = {};
 pub const InteriorTableEntry = {};
 pub const InteriorIndexEntry = {};
+
+const SqliteType = enum(u8) {
+    Null = 0,
+    Int8 = 1,
+    Int16 = 2,
+    Int24 = 3,
+    Int32 = 4,
+    Int48 = 5,
+    Int64 = 6,
+    Float64 = 7,
+    Zero = 8,
+    One = 9,
+    Blob = 12,
+    Text = 13,
+};
+
+const ColumnValue = union(SqliteType) {
+    Null: void,
+    Int8: i8,
+    Int16: i16,
+    Int24: i24,
+    Int32: i32,
+    Int48: i48,
+    Int64: i64,
+    Float64: f64,
+    Zero: void,
+    One: void,
+    Blob: []const u8,
+    Text: []const u8,
+};
+
+const LeafTableCell = struct {
+    payload_size: u64,
+    row_id: u64,
+    column_count: u64,
+    values: []ColumnValue,
+
+    pub fn deinit(self: *LeafTableCell, allocator: std.mem.Allocator) void {
+        allocator.free(self.values);
+    }
+
+    pub fn print(self: LeafTableCell) void {
+        std.debug.print("Record ID: {}\n", .{self.row_id});
+        std.debug.print("Column count: {}\n", .{self.column_count});
+
+        for (self.values, 0..) |value, i| {
+            std.debug.print("Column {}: ", .{i});
+            switch (value) {
+                .Null => std.debug.print("NULL", .{}),
+                .Int8 => |v| std.debug.print("{}", .{v}),
+                .Int16 => |v| std.debug.print("{}", .{v}),
+                .Int24 => |v| std.debug.print("{}", .{v}),
+                .Int32 => |v| std.debug.print("{}", .{v}),
+                .Int48 => |v| std.debug.print("{}", .{v}),
+                .Int64 => |v| std.debug.print("{}", .{v}),
+                .Float64 => |v| std.debug.print("{d}", .{v}),
+                .Zero => std.debug.print("0", .{}),
+                .One => std.debug.print("1", .{}),
+                .Blob => |v| std.debug.print("BLOB({})", .{v.len}),
+                .Text => |v| std.debug.print("'{s}'", .{v}),
+            }
+            std.debug.print("\n", .{});
+        }
+    }
+};
+
+fn getTypeFromSerial(serial_type: u64) !SqliteType {
+    return switch (serial_type) {
+        0 => .Null,
+        1 => .Int8,
+        2 => .Int16,
+        3 => .Int24,
+        4 => .Int32,
+        5 => .Int48,
+        6 => .Int64,
+        7 => .Float64,
+        8 => .Zero,
+        9 => .One,
+        10, 11 => return error.Reserved,
+        12 => .Blob,
+        13...219 => .Text,  // String lengths are encoded in the type
+        else => {
+        if (serial_type % 2 == 0) {
+            return .Blob;
+        } else {
+            return .Text;
+        }
+    },
+    };
+}
+
+fn readValue(allocator: std.mem.Allocator, reader: anytype, typ: SqliteType, serial_type: u64) !ColumnValue {
+    return switch (typ) {
+        .Null => .{ .Null = {} },
+        .Int8 => .{ .Int8 = @as(i8, @bitCast(try reader.readByte())) },
+        .Int16 => .{ .Int16 = try reader.readInt(i16, .big) },
+        .Int24 => {
+            var bytes: [3]u8 = undefined;
+            _ = try reader.readAll(&bytes);
+            const val = std.mem.readInt(i24, &bytes, .big);
+            return .{ .Int24 = val };
+        },
+        .Int32 => .{ .Int32 = try reader.readInt(i32, .big) },
+        .Int48 => {
+            var bytes: [6]u8 = undefined;
+            _ = try reader.readAll(&bytes);
+            const val = std.mem.readInt(i48, &bytes, .big);
+            return .{ .Int48 = val };
+        },
+        .Int64 => .{ .Int64 = try reader.readInt(i64, .big) },
+        .Float64 => {
+            var bytes: [8]u8 = undefined;
+            _ = try reader.readAll(&bytes);
+            const val = std.mem.readInt(u64, &bytes, .big);
+            return .{ .Float64 = @bitCast(val) };
+        },
+        .Zero => .{ .Zero = {} },
+        .One => .{ .One = {} },
+        .Text => {
+            const len = (serial_type - 13) / 2;
+            const buf = try allocator.alloc(u8, @intCast(len));
+            _ = try reader.readAll(buf);
+            return .{ .Text = buf };
+        },
+        .Blob => {
+            @panic("Blob not implemented yet");
+        },
+    };
+}
+
+fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
+    var stream = std.io.fixedBufferStream(data);
+    const reader = stream.reader();
+
+    const header_size = try readVarint(reader);
+    _ = try readVarint(reader);  // Skip the 0x00 byte
+    const first_type = try readVarint(reader);  // This is our actual type (0x13)
+    const column_count = 1;
+
+    std.debug.print("Header size: {}, First type: {x}\n", .{header_size, first_type});
+
+    var types = try std.ArrayList(SqliteType).initCapacity(allocator, column_count);
+    defer types.deinit();
+
+    const sqlite_type = try getTypeFromSerial(first_type);
+    try types.append(sqlite_type);
+
+    var values = try allocator.alloc(ColumnValue, types.items.len);
+    errdefer allocator.free(values);
+
+    for (types.items, 0..) |typ, i| {
+        values[i] = try readValue(allocator, reader, typ, first_type);
+    }
+
+    return LeafTableCell{
+        .payload_size = header_size,
+        .row_id = 1,
+        .column_count = column_count,
+        .values = values,
+    };
+}
+
+pub fn walkLeafPage(allocator: std.mem.Allocator, page: []const u8) !void {
+    if (page[0] != 0x0D) {
+        return error.NotALeafPage;
+    }
+
+    const cell_count = std.mem.readInt(u16, page[3..5], .big);
+    std.debug.print("Cell count: {}\n", .{cell_count});
+
+    var cell_index: usize = 0;
+    while (cell_index < cell_count) : (cell_index += 1) {
+        const pointer_offset = 8 + (cell_index * 2);
+        const cell_offset = std.mem.readInt(u16, page[pointer_offset..][0..2], .big);
+
+        std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
+
+        var stream = std.io.fixedBufferStream(page[cell_offset..]);
+        const reader = stream.reader();
+
+        const payload_size = try readVarint(reader);
+        const row_id = try readVarint(reader);
+
+        std.debug.print("  Payload size: {}, Row ID: {}\n", .{payload_size, row_id});
+
+        // Dump the raw payload for debugging
+        var payload_data = page[cell_offset + stream.pos .. cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
+        std.debug.print("Raw payload: ", .{});
+        for (payload_data[0..@min(payload_data.len, 32)]) |byte| {
+            std.debug.print("{x:0>2} ", .{byte});
+        }
+        std.debug.print("\n", .{});
+
+        var record = try parseRecord(allocator, payload_data);
+        defer record.deinit(allocator);
+        record.print();
+    }
+}
+
+fn readVarint(reader: anytype) !u64 {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+
+    while (true) {
+        const byte = try reader.readByte();
+        result |= @as(u64, byte & 0x7F) << shift;
+
+        if (byte & 0x80 == 0) break;
+        shift += 7;
+        if (shift >= 64) return error.VarintTooBig;
+    }
+
+    return result;
+}
