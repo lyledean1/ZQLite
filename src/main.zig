@@ -10,17 +10,19 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <expr>\n", .{args[0]});
+        std.debug.print("Usage: {s} <file> \n", .{args[0]});
         return;
     }
-    const expr = args[1];
-    var tokenizer = parser.Tokenizer.init(expr, allocator);
-    const tokens = try tokenizer.tokenize();
+    const file = args[1];
+    // var tokenizer = parser.Tokenizer.init(expr, allocator);
+    // const tokens = try tokenizer.tokenize();
+    //
+    // for (tokens.items) |str| {
+    //     std.debug.print("{s}\n", .{str.value});
+    // }
 
-    for (tokens.items) |str| {
-        std.debug.print("{s}\n", .{str.value});
-    }
-
-    var db = try sql.Db.init("db/test.db");
+    var db = try sql.Db.open(file);
+    try db.readInfo();
+    try db.printDbInfo(std.io.getStdOut().writer());
     defer db.deinit();
 }
