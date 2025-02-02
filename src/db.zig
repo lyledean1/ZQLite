@@ -45,7 +45,7 @@ const PageHeader = struct {
         std.debug.print("First Free Block: 0x{x}\n", .{self.first_free_block});
         std.debug.print("Cell Count: {}\n", .{self.cell_count});
         std.debug.print("Start Of Cell Content Area: {}\n", .{self.start_of_cell_content_area});
-        std.debug.print("Fragmented Free Bytes: {}\n", .{self.start_of_cell_content_area});
+        std.debug.print("Fragmented Free Bytes: {}\n", .{self.fragmented_free_bytes});
     }
 };
 
@@ -124,9 +124,6 @@ pub const Db = struct {
         const page_size: u32 = @intCast(info.databasePageSize);
         const page = try self.read_range(allocator, (page_size*page_number) - page_size + page_offset, page_size*page_number);
 
-        // // defer allocator.free(page); todo: handle this memory deinit somewhere?
-        // _ = try self.file.readAll(page);
-
         // see https://www.sqlite.org/fileformat2.html#b_tree_pages for more details
         var page_header: PageHeader = undefined;
         const page_type = page[0];
@@ -137,7 +134,7 @@ pub const Db = struct {
         page_header.max_overflow_payload_size = try get_max_overload_payload_size(page_type, info.usablePageSize);
         page_header.first_free_block = std.mem.readInt(u16, page[1..3][0..2], .big);
         page_header.cell_count = std.mem.readInt(u16, page[3..5][0..2], .big);
-        page_header.start_of_cell_content_area = std.mem.readInt(u16, page[5..7][0..2], .big);
+        page_header.start_of_cell_content_area = std.mem.readInt(u16, page[5..7], .big);
         if (page_header.start_of_cell_content_area == 0) {
             page_header.start_of_cell_content_area = 65536;
         }
@@ -230,42 +227,36 @@ pub const Db = struct {
 
     fn walk_leaf_page(_: *Db, allocator: std.mem.Allocator, page_header: PageHeader) ![]LeafTableCell {
         var list = std.ArrayList(LeafTableCell).init(allocator);
-        std.debug.print("Cell here: {}\n", .{1});
-        const page = page_header.page;
-        if (page[0] != @intFromEnum(PageType.leaf_table)) {
+        defer list.deinit(); // Add defer to prevent memory leaks
+
+        if (page_header.page_type != @intFromEnum(PageType.leaf_table)) {
             return error.NotALeafPage;
         }
 
-        const cell_count = page_header.cell_count;
-        // std.debug.print("Cell count: {}\n", .{cell_count});
-
         var cell_index: usize = 0;
-        while (cell_index < cell_count) : (cell_index += 1) {
-            const pointer_offset = cell_count + (cell_index * 2);
-            const cell_offset = std.mem.readInt(u16, page[pointer_offset..][0..2], .big);
+        while (cell_index < page_header.cell_count) : (cell_index += 1) {
+            // Use cell_pointer_array_offset instead of just cell_count
+        const pointer_offset = page_header.cell_pointer_array_offset + (cell_index * 2);
+            const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
 
-            // std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
+            std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
+            page_header.print();
 
-            var stream = std.io.fixedBufferStream(page[cell_offset..]);
+            // Use start_of_cell_content_area to ensure we're reading from the correct location
+        var stream = std.io.fixedBufferStream(page_header.page[cell_offset..]);
             const reader = stream.reader();
 
             const payload_size = try readVarint(reader);
-            // pass through row id
-        _ = try readVarint(reader);
+            _ = try readVarint(reader); // row id
 
-            // std.debug.print("  Payload size: {}, Row ID: {}\n", .{payload_size, row_id});
-
-            // Dump the raw payload for debugging
-        const payload_data = page[cell_offset + stream.pos .. cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
-            // std.debug.print("Raw payload: ", .{});
-            // for (payload_data[0..@min(payload_data.len, 32)]) |byte| {
-            //     std.debug.print("{x:0>2} ", .{byte});
-            // }
-            // std.debug.print("\n", .{});
+        // Calculate payload position using current stream position
+        const payload_data = page_header.page[cell_offset + stream.pos ..
+            cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
 
             const record = try parseRecord(allocator, payload_data);
             try list.append(record);
         }
+
         return list.toOwnedSlice();
     }
 
@@ -402,8 +393,8 @@ const LeafTableCell = struct {
     }
 
     pub fn print(self: LeafTableCell) void {
-        // std.debug.print("Record ID: {}\n", .{self.row_id});
-        // std.debug.print("Column count: {}\n", .{self.column_count});
+        std.debug.print("Record ID: {}\n", .{self.row_id});
+        std.debug.print("Column count: {}\n", .{self.column_count});
 
         for (self.values, 0..) |value, i| {
             std.debug.print("Column {}: ", .{i});
