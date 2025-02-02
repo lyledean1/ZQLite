@@ -1,6 +1,54 @@
 const std = @import("std");
 const mem = std.mem;
 
+const PageType = enum(u8) {
+    interior_table = 0x05,
+    interior_index = 0x02,
+    leaf_table = 0x0d,
+    leaf_index = 0x0a,
+    free_list = 0x00,
+    free_list_trunk = 0x01,
+
+    // If you need to handle unknown types
+    pub fn fromByte(byte: u8) ?PageType {
+        return switch (byte) {
+            0x05 => .interior_table,
+            0x02 => .interior_index,
+            0x0d => .leaf_table,
+            0x0a => .leaf_index,
+            0x00 => .free_list,
+            0x01 => .free_list_trunk,
+            else => null,
+        };
+    }
+};
+
+const PageHeader = struct {
+    page: []const u8,
+    page_offset: u8,
+    page_type: u8,
+    first_free_block: u16,
+    cell_count: u16,
+    start_of_cell_content_area: u32,
+    fragmented_free_bytes: u8,
+    cell_pointer_array_offset: u32,
+    right_most_pointer: u32,
+    unallocated_region_size: u32,
+    min_overflow_payload_size: u32,
+    max_overflow_payload_size: u32,
+
+    pub fn print(self: *const PageHeader) void {
+        std.debug.print("Page offset: {}\n", .{self.page_offset});
+        std.debug.print("Page type: 0x{x}\n", .{self.page_type});
+        std.debug.print("Min Overflow Page Size: {}\n", .{self.min_overflow_payload_size});
+        std.debug.print("Max Overflow Page Size: {}\n", .{self.max_overflow_payload_size});
+        std.debug.print("First Free Block: 0x{x}\n", .{self.first_free_block});
+        std.debug.print("Cell Count: {}\n", .{self.cell_count});
+        std.debug.print("Start Of Cell Content Area: {}\n", .{self.start_of_cell_content_area});
+        std.debug.print("Fragmented Free Bytes: {}\n", .{self.start_of_cell_content_area});
+    }
+};
+
 pub const Db = struct {
     file: std.fs.File,
     info: ?DbInfo = null,
@@ -32,8 +80,8 @@ pub const Db = struct {
 
         // Start of page 1 after header (0x60 onwards)
         const page1 = [_]u8{
-            0x00, 0x2e, 0x6e, 0xba, 0x0d, 0x00, 0x00, 0x00,
-            0x00, 0x0f, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x2e, 0x6e, 0xba, @intFromEnum(PageType.leaf_table), 0x00, 0x00, 0x00,
+            0x00, 0x0f, 0xf4, 0x00, 0x00,                              0x00, 0x00, 0x00,
         };
 
         try file.writeAll(&header);
@@ -63,13 +111,58 @@ pub const Db = struct {
         self.info = try readDbInfo(self);
     }
 
-    pub fn readPage(self: *Db, allocator: std.mem.Allocator) !void {
-        // Seek to second page (4096 bytes)
+    pub fn get_page(self: *Db, allocator: std.mem.Allocator, page_number: u32) !PageHeader {
+        const info = self.info orelse return error.NoDbInfo;
+        const page_offset: u32 = 0;
+        if (page_number < 1) {
+            return error.InvalidPageNumber;
+        }
+        // if (page_number == 1) {
+        //     page_offset += 100;
+        // }
+        const page_size: u32 = @intCast(info.databasePageSize);
         try self.file.seekTo(4096);
+
+
+        const page = try allocator.alloc(u8, page_size);
+        defer allocator.free(page);
+        _ = try self.file.readAll(page);
+
+        // see https://www.sqlite.org/fileformat2.html#b_tree_pages for more details
+        var page_header: PageHeader = undefined;
+        const page_type = page[0];
+        page_header.page = page;
+        page_header.page_offset = page_offset;
+        page_header.page_type = page_type;
+        page_header.min_overflow_payload_size = ((info.usablePageSize - 12) * 32 / 255) - 23;
+        page_header.max_overflow_payload_size = try get_max_overload_payload_size(page_type, info.usablePageSize);
+        page_header.first_free_block = std.mem.readInt(u16, page[1..3][0..2], .big);
+        page_header.cell_count = std.mem.readInt(u16, page[3..5][0..2], .big);
+        page_header.start_of_cell_content_area = std.mem.readInt(u16, page[5..7][0..2], .big);
+        if (page_header.start_of_cell_content_area == 0) {
+            page_header.start_of_cell_content_area = 65536;
+        }
+        page_header.fragmented_free_bytes = page[7];
+        page_header.cell_pointer_array_offset = 8;
+        if (page_type == 0x02 or page_type == 0x05) {
+                page_header.right_most_pointer = std.mem.readInt(u16, page[8..12][0..2], .big);
+                page_header.cell_pointer_array_offset += 4;
+        }
+        page_header.unallocated_region_size = page_header.start_of_cell_content_area - (page_header.cell_pointer_array_offset + (page_header.cell_count * 2));
+        page_header.cell_pointer_array_offset += page_offset;
+        return page_header;
+    }
+
+    pub fn readPage(self: *Db, allocator: std.mem.Allocator, page_number: u32) ![]LeafTableCell {
+        // Seek to second page (4096 bytes)
+        const info = self.info orelse return error.NoDbInfo;
+        const page_size: u32 = @intCast(info.databasePageSize);
+        try self.file.seekTo(page_size*page_number);
 
         var page: [4096]u8 = undefined;
         _ = try self.file.readAll(&page);
-        try walkLeafPage(allocator, &page);
+        const records = try walkLeafPage(allocator, &page);
+        return records;
     }
 
     pub fn printDbInfo(self: *Db, writer: anytype) !void {
@@ -77,13 +170,13 @@ pub const Db = struct {
 
         // Get encoding description
         const encoding_description = switch (info.textEncoding) {
-                1 => " (utf8)",
-                2 => " (utf16le)",
-                3 => " (utf16be)",
-                else => "",
-            };
+            1 => " (utf8)",
+            2 => " (utf16le)",
+            3 => " (utf16be)",
+            else => "",
+        };
 
-            // Print all fields
+        // Print all fields
         try writer.print("database page size:  {d}\n", .{info.databasePageSize});
         try writer.print("write format:        {d}\n", .{info.writeFormat});
         try writer.print("read format:         {d}\n", .{info.readFormat});
@@ -96,7 +189,7 @@ pub const Db = struct {
         try writer.print("default cache size:  {d}\n", .{info.defaultCacheSize});
         try writer.print("autovacuum top root: {d}\n", .{info.autovacuumTopRoot});
         try writer.print("incremental vacuum:  {d}\n", .{info.incrementalVacuum});
-        try writer.print("text encoding:       {d}{s}\n", .{info.textEncoding, encoding_description});
+        try writer.print("text encoding:       {d}{s}\n", .{ info.textEncoding, encoding_description });
         try writer.print("user version:        {d}\n", .{info.userVersion});
         try writer.print("application id:      {d}\n", .{info.applicationId});
         try writer.print("software version:    {d}\n", .{info.softwareVersion});
@@ -107,6 +200,23 @@ pub const Db = struct {
         // try writer.print("schema size:         {d}\n", .{info.schemaSize});
     }
 
+    pub fn scan_table(self: *Db, allocator: std.mem.Allocator, root_page: u32) ![]TableRecord {
+        var table_data = std.ArrayList(TableRecord).init(allocator);
+        errdefer table_data.deinit();
+        try self.walk_btree_table_pages(allocator, root_page, &table_data);
+        return table_data.toOwnedSlice();
+    }
+
+    fn walk_btree_table_pages(self: *Db, allocator: std.mem.Allocator, page: u32, _: *std.ArrayList(TableRecord)) !void {
+        const records = try self.readPage(allocator, page);
+        for (records) |record| {
+            for (record.values) |value| {
+                printColumnValue(value);
+            }
+        }
+        const page_header = try self.get_page(allocator, page);
+        page_header.print();
+    }
 
     pub fn deinit(self: *Db) void {
         self.file.close();
@@ -191,10 +301,11 @@ const DbInfo = struct {
     usablePageSize: u32,
 };
 
-pub const SchemaEntry = {};
-pub const ColumnDef = {};
-pub const PageHeader = {};
-pub const TableRecord = {};
+const SchemaEntry = struct { schemaType: []const u8, name: []const u8, tableName: []const u8, rootPage: u8, columns: []ColumnDef, constraints: [][]const u8 };
+const ColumnDef = struct { name: []const u8, columnType: []const u8, constraints: [][]const u8 };
+const TableRecord = struct {
+
+};
 pub const TableRawRecord = {};
 pub const InteriorTableEntry = {};
 pub const InteriorIndexEntry = {};
@@ -278,14 +389,14 @@ fn getTypeFromSerial(serial_type: u64) !SqliteType {
         9 => .One,
         10, 11 => return error.Reserved,
         12 => .Blob,
-        13...219 => .Text,  // String lengths are encoded in the type
+        13...219 => .Text, // String lengths are encoded in the type
         else => {
-        if (serial_type % 2 == 0) {
-            return .Blob;
-        } else {
-            return .Text;
-        }
-    },
+            if (serial_type % 2 == 0) {
+                return .Blob;
+            } else {
+                return .Text;
+            }
+        },
     };
 }
 
@@ -333,11 +444,11 @@ fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
     const reader = stream.reader();
 
     const header_size = try readVarint(reader);
-    _ = try readVarint(reader);  // Skip the 0x00 byte
-    const first_type = try readVarint(reader);  // This is our actual type (0x13)
+    _ = try readVarint(reader); // Skip the 0x00 byte
+    const first_type = try readVarint(reader); // This is our actual type (0x13)
     const column_count = 1;
 
-    std.debug.print("Header size: {}, First type: {x}\n", .{header_size, first_type});
+    // std.debug.print("Header size: {}, First type: {x}\n", .{header_size, first_type});
 
     var types = try std.ArrayList(SqliteType).initCapacity(allocator, column_count);
     defer types.deinit();
@@ -360,41 +471,43 @@ fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
     };
 }
 
-pub fn walkLeafPage(allocator: std.mem.Allocator, page: []const u8) !void {
-    if (page[0] != 0x0D) {
+pub fn walkLeafPage(allocator: std.mem.Allocator, page: []const u8) ![]LeafTableCell {
+    var list = std.ArrayList(LeafTableCell).init(allocator);
+    if (page[0] != @intFromEnum(PageType.leaf_table)) {
         return error.NotALeafPage;
     }
 
     const cell_count = std.mem.readInt(u16, page[3..5], .big);
-    std.debug.print("Cell count: {}\n", .{cell_count});
+    // std.debug.print("Cell count: {}\n", .{cell_count});
 
     var cell_index: usize = 0;
     while (cell_index < cell_count) : (cell_index += 1) {
         const pointer_offset = 8 + (cell_index * 2);
         const cell_offset = std.mem.readInt(u16, page[pointer_offset..][0..2], .big);
 
-        std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
+        // std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
 
         var stream = std.io.fixedBufferStream(page[cell_offset..]);
         const reader = stream.reader();
 
         const payload_size = try readVarint(reader);
-        const row_id = try readVarint(reader);
+        // pass through row id
+        _ = try readVarint(reader);
 
-        std.debug.print("  Payload size: {}, Row ID: {}\n", .{payload_size, row_id});
+        // std.debug.print("  Payload size: {}, Row ID: {}\n", .{payload_size, row_id});
 
         // Dump the raw payload for debugging
-        var payload_data = page[cell_offset + stream.pos .. cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
-        std.debug.print("Raw payload: ", .{});
-        for (payload_data[0..@min(payload_data.len, 32)]) |byte| {
-            std.debug.print("{x:0>2} ", .{byte});
-        }
-        std.debug.print("\n", .{});
+        const payload_data = page[cell_offset + stream.pos .. cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
+        // std.debug.print("Raw payload: ", .{});
+        // for (payload_data[0..@min(payload_data.len, 32)]) |byte| {
+        //     std.debug.print("{x:0>2} ", .{byte});
+        // }
+        // std.debug.print("\n", .{});
 
-        var record = try parseRecord(allocator, payload_data);
-        defer record.deinit(allocator);
-        record.print();
+        const record = try parseRecord(allocator, payload_data);
+        try list.append(record);
     }
+    return list.toOwnedSlice();
 }
 
 fn readVarint(reader: anytype) !u64 {
@@ -411,4 +524,35 @@ fn readVarint(reader: anytype) !u64 {
     }
 
     return result;
+}
+
+pub fn printColumnValue(value: ColumnValue) void {
+    switch (value) {
+        .Null => std.debug.print("NULL\n", .{}),
+        .Int8 => |v| std.debug.print("Int8: {}\n", .{v}),
+        .Int16 => |v| std.debug.print("Int16: {}\n", .{v}),
+        .Int24 => |v| std.debug.print("Int24: {}\n", .{v}),
+        .Int32 => |v| std.debug.print("Int32: {}\n", .{v}),
+        .Int48 => |v| std.debug.print("Int48: {}\n", .{v}),
+        .Int64 => |v| std.debug.print("Int64: {}\n", .{v}),
+        .Float64 => |v| std.debug.print("Float64: {d}\n", .{v}),
+        .Zero => std.debug.print("Zero\n", .{}),
+        .One => std.debug.print("One\n", .{}),
+        .Blob => |v| std.debug.print("Blob: {any}\n", .{v}),
+        .Text => |v| std.debug.print("Text: {s}\n", .{v}),
+    }
+}
+
+fn get_max_overload_payload_size(page_type: u32, usable_page_size: u32) !u32 {
+    switch (page_type) {
+        0x02, 0x0a => {
+            return ((usable_page_size - 12) * 64 / 255) - 23;
+        },
+        0x0d, 0x05 => {
+            return (usable_page_size - 35);
+        },
+        else => {
+            return error.InvalidPageSize;
+        }
+    }
 }
