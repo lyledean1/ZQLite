@@ -24,6 +24,12 @@ pub fn main() !void {
     var db = try sql.Db.open(file);
     try db.readInfo();
     try db.printDbInfo(std.io.getStdOut().writer());
-    _ = try db.scan_table(allocator, 1);
+    const records = try db.scan_table(allocator, 1);
+    for (records) |record| {
+        record.print();
+        // for (record.values) |value| {
+        //     sql.printColumnValue(value);
+        // }
+    }
     defer db.deinit();
 }

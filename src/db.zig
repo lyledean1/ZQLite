@@ -120,14 +120,12 @@ pub const Db = struct {
         if (page_number == 1) {
             page_offset += 100;
         }
-        const seek_to = (page_number - 1 + 1) * 4096;
+        // const seek_to = (page_number) * 4096;
         const page_size: u32 = @intCast(info.databasePageSize);
-        try self.file.seekTo(seek_to);
+        const page = try self.read_range(allocator, (page_size*page_number) - page_size + page_offset, page_size*page_number);
 
-
-        const page = try allocator.alloc(u8, page_size);
-        defer allocator.free(page);
-        _ = try self.file.readAll(page);
+        // // defer allocator.free(page); todo: handle this memory deinit somewhere?
+        // _ = try self.file.readAll(page);
 
         // see https://www.sqlite.org/fileformat2.html#b_tree_pages for more details
         var page_header: PageHeader = undefined;
@@ -154,16 +152,14 @@ pub const Db = struct {
         return page_header;
     }
 
-    pub fn readPage(self: *Db, allocator: std.mem.Allocator, page_number: u32) ![]LeafTableCell {
-        // Seek to second page (4096 bytes)
-        const info = self.info orelse return error.NoDbInfo;
-        const page_size: u32 = @intCast(info.databasePageSize);
-        try self.file.seekTo(page_size*page_number);
-
-        var page: [4096]u8 = undefined;
-        _ = try self.file.readAll(&page);
-        const records = try walkLeafPage(allocator, &page);
-        return records;
+    pub fn read_range(self: *Db, allocator:  std.mem.Allocator, from: usize, to: usize) ![]const u8 {
+        const buffer = try allocator.alloc(u8, to - from);
+        try self.file.seekTo(from);
+        const bytes_read = try self.file.readAll(buffer);
+        if (bytes_read != buffer.len) {
+            return error.UnexpectedEOF;
+        }
+        return buffer;
     }
 
     pub fn printDbInfo(self: *Db, writer: anytype) !void {
@@ -201,25 +197,23 @@ pub const Db = struct {
         // try writer.print("schema size:         {d}\n", .{info.schemaSize});
     }
 
-    pub fn scan_table(self: *Db, allocator: std.mem.Allocator, root_page: u32) ![]TableRecord {
-        var table_data = std.ArrayList(TableRecord).init(allocator);
+    pub fn scan_table(self: *Db, allocator: std.mem.Allocator, root_page: u32) ![]LeafTableCell {
+        var table_data = std.ArrayList(LeafTableCell).init(allocator);
         errdefer table_data.deinit();
         try self.walk_btree_table_pages(allocator, root_page, &table_data);
         return table_data.toOwnedSlice();
     }
 
-    fn walk_btree_table_pages(self: *Db, allocator: std.mem.Allocator, page: u32, _: *std.ArrayList(TableRecord)) !void {
+    fn walk_btree_table_pages(self: *Db, allocator: std.mem.Allocator, page: u32, table_data: *std.ArrayList(LeafTableCell)) !void {
         const page_header = try self.get_page(allocator, page);
         switch (page_header.page_type) {
             0x05 => {
                 return error.NotImplementedForPageType0x05;
             },
             0x0d => {
-                const records = try self.readPage(allocator, page);
+                const records = try self.walk_leaf_page(allocator, page_header);
                 for (records) |record| {
-                    for (record.values) |value| {
-                        printColumnValue(value);
-                    }
+                    try table_data.append(record);
                 }
             },
             0x02 => {
@@ -232,6 +226,47 @@ pub const Db = struct {
                 return error.UnknownPageType;
             }
         }
+    }
+
+    fn walk_leaf_page(_: *Db, allocator: std.mem.Allocator, page_header: PageHeader) ![]LeafTableCell {
+        var list = std.ArrayList(LeafTableCell).init(allocator);
+        std.debug.print("Cell here: {}\n", .{1});
+        const page = page_header.page;
+        if (page[0] != @intFromEnum(PageType.leaf_table)) {
+            return error.NotALeafPage;
+        }
+
+        const cell_count = page_header.cell_count;
+        // std.debug.print("Cell count: {}\n", .{cell_count});
+
+        var cell_index: usize = 0;
+        while (cell_index < cell_count) : (cell_index += 1) {
+            const pointer_offset = cell_count + (cell_index * 2);
+            const cell_offset = std.mem.readInt(u16, page[pointer_offset..][0..2], .big);
+
+            // std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
+
+            var stream = std.io.fixedBufferStream(page[cell_offset..]);
+            const reader = stream.reader();
+
+            const payload_size = try readVarint(reader);
+            // pass through row id
+        _ = try readVarint(reader);
+
+            // std.debug.print("  Payload size: {}, Row ID: {}\n", .{payload_size, row_id});
+
+            // Dump the raw payload for debugging
+        const payload_data = page[cell_offset + stream.pos .. cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
+            // std.debug.print("Raw payload: ", .{});
+            // for (payload_data[0..@min(payload_data.len, 32)]) |byte| {
+            //     std.debug.print("{x:0>2} ", .{byte});
+            // }
+            // std.debug.print("\n", .{});
+
+            const record = try parseRecord(allocator, payload_data);
+            try list.append(record);
+        }
+        return list.toOwnedSlice();
     }
 
     pub fn deinit(self: *Db) void {
@@ -367,8 +402,8 @@ const LeafTableCell = struct {
     }
 
     pub fn print(self: LeafTableCell) void {
-        std.debug.print("Record ID: {}\n", .{self.row_id});
-        std.debug.print("Column count: {}\n", .{self.column_count});
+        // std.debug.print("Record ID: {}\n", .{self.row_id});
+        // std.debug.print("Column count: {}\n", .{self.column_count});
 
         for (self.values, 0..) |value, i| {
             std.debug.print("Column {}: ", .{i});
@@ -485,45 +520,6 @@ fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
         .column_count = column_count,
         .values = values,
     };
-}
-
-pub fn walkLeafPage(allocator: std.mem.Allocator, page: []const u8) ![]LeafTableCell {
-    var list = std.ArrayList(LeafTableCell).init(allocator);
-    if (page[0] != @intFromEnum(PageType.leaf_table)) {
-        return error.NotALeafPage;
-    }
-
-    const cell_count = std.mem.readInt(u16, page[3..5], .big);
-    // std.debug.print("Cell count: {}\n", .{cell_count});
-
-    var cell_index: usize = 0;
-    while (cell_index < cell_count) : (cell_index += 1) {
-        const pointer_offset = 8 + (cell_index * 2);
-        const cell_offset = std.mem.readInt(u16, page[pointer_offset..][0..2], .big);
-
-        // std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
-
-        var stream = std.io.fixedBufferStream(page[cell_offset..]);
-        const reader = stream.reader();
-
-        const payload_size = try readVarint(reader);
-        // pass through row id
-        _ = try readVarint(reader);
-
-        // std.debug.print("  Payload size: {}, Row ID: {}\n", .{payload_size, row_id});
-
-        // Dump the raw payload for debugging
-        const payload_data = page[cell_offset + stream.pos .. cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
-        // std.debug.print("Raw payload: ", .{});
-        // for (payload_data[0..@min(payload_data.len, 32)]) |byte| {
-        //     std.debug.print("{x:0>2} ", .{byte});
-        // }
-        // std.debug.print("\n", .{});
-
-        const record = try parseRecord(allocator, payload_data);
-        try list.append(record);
-    }
-    return list.toOwnedSlice();
 }
 
 fn readVarint(reader: anytype) !u64 {
