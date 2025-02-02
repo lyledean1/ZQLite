@@ -113,15 +113,16 @@ pub const Db = struct {
 
     pub fn get_page(self: *Db, allocator: std.mem.Allocator, page_number: u32) !PageHeader {
         const info = self.info orelse return error.NoDbInfo;
-        const page_offset: u32 = 0;
+        var page_offset: u8 = 0;
         if (page_number < 1) {
             return error.InvalidPageNumber;
         }
-        // if (page_number == 1) {
-        //     page_offset += 100;
-        // }
+        if (page_number == 1) {
+            page_offset += 100;
+        }
+        const seek_to = (page_number - 1 + 1) * 4096;
         const page_size: u32 = @intCast(info.databasePageSize);
-        try self.file.seekTo(4096);
+        try self.file.seekTo(seek_to);
 
 
         const page = try allocator.alloc(u8, page_size);
@@ -208,14 +209,29 @@ pub const Db = struct {
     }
 
     fn walk_btree_table_pages(self: *Db, allocator: std.mem.Allocator, page: u32, _: *std.ArrayList(TableRecord)) !void {
-        const records = try self.readPage(allocator, page);
-        for (records) |record| {
-            for (record.values) |value| {
-                printColumnValue(value);
+        const page_header = try self.get_page(allocator, page);
+        switch (page_header.page_type) {
+            0x05 => {
+                return error.NotImplementedForPageType0x05;
+            },
+            0x0d => {
+                const records = try self.readPage(allocator, page);
+                for (records) |record| {
+                    for (record.values) |value| {
+                        printColumnValue(value);
+                    }
+                }
+            },
+            0x02 => {
+                return error.NotImplementedForPageType0x02;
+            },
+            0x0a => {
+                return error.NotImplementedForPageType0x0a;
+            },
+            else => {
+                return error.UnknownPageType;
             }
         }
-        const page_header = try self.get_page(allocator, page);
-        page_header.print();
     }
 
     pub fn deinit(self: *Db) void {
