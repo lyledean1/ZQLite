@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = @import("std").debug.assert;
 const mem = std.mem;
 
 const PageType = enum(u8) {
@@ -236,22 +237,24 @@ pub const Db = struct {
         var cell_index: usize = 0;
         while (cell_index < page_header.cell_count) : (cell_index += 1) {
             // Use cell_pointer_array_offset instead of just cell_count
-        const pointer_offset = page_header.cell_pointer_array_offset + (cell_index * 2);
+            const page_offset = page_header.page_offset;
+            const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (cell_index * 2);
             const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
-
-            std.debug.print("\nCell {}: offset=0x{x:0>4}\n", .{cell_index, cell_offset});
+            std.debug.print("\nCell {}: offset=0x{x:0>4} pointer offset={}\n", .{cell_index, cell_offset, pointer_offset});
             page_header.print();
-
             // Use start_of_cell_content_area to ensure we're reading from the correct location
-        var stream = std.io.fixedBufferStream(page_header.page[cell_offset..]);
-            const reader = stream.reader();
+            const stream = std.io.fixedBufferStream(page_header.page[(cell_offset-page_offset)..]);
 
-            const payload_size = try readVarint(reader);
-            _ = try readVarint(reader); // row id
+            const varint_value = try readVarint(page_header.page[(cell_offset-page_offset)..]);
+            const payload_size = varint_value.value;
+            const varint_row_id = try readVarint(page_header.page[(cell_offset-page_offset)..]); // row id
+            const id = varint_row_id.value;
+            const start = cell_offset + stream.pos;
+            const end = start + @as(usize, @intCast(payload_size));
+            std.debug.print("\nstart {} end {} id {} payload_size {} and len {}\n", .{start-page_offset, end-page_offset, id, payload_size, page_header.page.len});
 
-        // Calculate payload position using current stream position
-        const payload_data = page_header.page[cell_offset + stream.pos ..
-            cell_offset + stream.pos + @as(usize, @intCast(payload_size))];
+            // Calculate payload position using current stream position
+            const payload_data = page_header.page[(start-page_offset) .. (end-page_offset) - 1];
 
             const record = try parseRecord(allocator, payload_data);
             try list.append(record);
@@ -417,6 +420,13 @@ const LeafTableCell = struct {
     }
 };
 
+const SerialTypeInfo = struct { sql_type: SqliteType, serial_type: u64};
+
+fn getTypeAndSizeFromSerial(serial_type: u64) !SerialTypeInfo {
+    const sqlite_type = try getTypeFromSerial(serial_type);
+    return SerialTypeInfo{ .sql_type = sqlite_type, .serial_type = serial_type };
+}
+
 fn getTypeFromSerial(serial_type: u64) !SqliteType {
     return switch (serial_type) {
         0 => .Null,
@@ -442,91 +452,47 @@ fn getTypeFromSerial(serial_type: u64) !SqliteType {
     };
 }
 
-fn readValue(allocator: std.mem.Allocator, reader: anytype, typ: SqliteType, serial_type: u64) !ColumnValue {
+fn readValue(typ: SqliteType, serial_type: u64, data: []const u8) !struct{col: ColumnValue, n: u64} {
+    var stream = std.io.fixedBufferStream(data);
+    var reader = stream.reader();
+
     return switch (typ) {
-        .Null => .{ .Null = {} },
-        .Int8 => .{ .Int8 = @as(i8, @bitCast(try reader.readByte())) },
-        .Int16 => .{ .Int16 = try reader.readInt(i16, .big) },
+        .Null => .{.col=ColumnValue{ .Null = {}}, .n = 0 },
+        .Int8 => .{.col= ColumnValue{.Int8 = @as(i8, @bitCast(try reader.readByte())) },.n = 1},
+        .Int16 => .{ .col=ColumnValue{.Int16 = try reader.readInt(i16, .big) },.n = 2},
         .Int24 => {
             var bytes: [3]u8 = undefined;
             _ = try reader.readAll(&bytes);
             const val = std.mem.readInt(i24, &bytes, .big);
-            return .{ .Int24 = val };
+            return .{ .col=ColumnValue{.Int24 = val },.n = 3};
         },
-        .Int32 => .{ .Int32 = try reader.readInt(i32, .big) },
+        .Int32 => .{ .col=ColumnValue{.Int32 = try reader.readInt(i32, .big) },.n = 4},
         .Int48 => {
             var bytes: [6]u8 = undefined;
             _ = try reader.readAll(&bytes);
             const val = std.mem.readInt(i48, &bytes, .big);
-            return .{ .Int48 = val };
+            return .{.col=ColumnValue{ .Int48 = val },.n = 6};
         },
-        .Int64 => .{ .Int64 = try reader.readInt(i64, .big) },
+        .Int64 => .{.col=ColumnValue{ .Int64 = try reader.readInt(i64, .big) },.n = 8},
         .Float64 => {
             var bytes: [8]u8 = undefined;
             _ = try reader.readAll(&bytes);
             const val = std.mem.readInt(u64, &bytes, .big);
-            return .{ .Float64 = @bitCast(val) };
+            return .{.col=ColumnValue{  .Float64 = @bitCast(val) },.n = 8};
         },
-        .Zero => .{ .Zero = {} },
-        .One => .{ .One = {} },
+        .Zero => .{.col=ColumnValue{ .Zero = {}}, .n =0},
+        .One => .{.col=ColumnValue{ .One = {} }, .n =1},
         .Text => {
             const len = (serial_type - 13) / 2;
-            const buf = try allocator.alloc(u8, @intCast(len));
-            _ = try reader.readAll(buf);
-            return .{ .Text = buf };
+            const start_pos = stream.pos;
+            const text_slice = data[start_pos..][0..@intCast(len)];
+            try stream.seekBy(@intCast(len));
+            return .{.col=ColumnValue{  .Text = text_slice}, .n = len };
         },
         .Blob => {
             @panic("Blob not implemented yet");
         },
     };
-}
-
-fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
-    var stream = std.io.fixedBufferStream(data);
-    const reader = stream.reader();
-
-    const header_size = try readVarint(reader);
-    _ = try readVarint(reader); // Skip the 0x00 byte
-    const first_type = try readVarint(reader); // This is our actual type (0x13)
-    const column_count = 1;
-
-    // std.debug.print("Header size: {}, First type: {x}\n", .{header_size, first_type});
-
-    var types = try std.ArrayList(SqliteType).initCapacity(allocator, column_count);
-    defer types.deinit();
-
-    const sqlite_type = try getTypeFromSerial(first_type);
-    try types.append(sqlite_type);
-
-    var values = try allocator.alloc(ColumnValue, types.items.len);
-    errdefer allocator.free(values);
-
-    for (types.items, 0..) |typ, i| {
-        values[i] = try readValue(allocator, reader, typ, first_type);
-    }
-
-    return LeafTableCell{
-        .payload_size = header_size,
-        .row_id = 1,
-        .column_count = column_count,
-        .values = values,
-    };
-}
-
-fn readVarint(reader: anytype) !u64 {
-    var result: u64 = 0;
-    var shift: u6 = 0;
-
-    while (true) {
-        const byte = try reader.readByte();
-        result |= @as(u64, byte & 0x7F) << shift;
-
-        if (byte & 0x80 == 0) break;
-        shift += 7;
-        if (shift >= 64) return error.VarintTooBig;
-    }
-
-    return result;
 }
 
 pub fn printColumnValue(value: ColumnValue) void {
@@ -556,6 +522,134 @@ fn get_max_overload_payload_size(page_type: u32, usable_page_size: u32) !u32 {
         },
         else => {
             return error.InvalidPageSize;
+        }
+    }
+}
+
+fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
+    var pos: usize = 0;
+    std.debug.print("Here: \n", .{});
+    const varintHeader = try readVarint(data);
+    var headerSize = varintHeader.value;
+    std.debug.print("Size: {}\n", .{headerSize});
+    var nr = varintHeader.size;
+    assert(headerSize >= nr);
+    headerSize = headerSize - nr;
+    pos += nr;
+    var serialTypes = std.ArrayList(SerialTypeInfo).init(allocator);
+    errdefer serialTypes.deinit();
+    std.debug.print("Size: {}\n", .{headerSize});
+
+    while (headerSize > 0) {
+        const currentPayload = data[pos..];
+        const types = try readVarint(currentPayload);
+        nr = types.size;
+        const serialTypeInfo = try getTypeAndSizeFromSerial(types.value);
+        try serialTypes.append(serialTypeInfo);
+        pos += nr;
+        assert(headerSize >= nr);
+        headerSize -= nr;
+    }
+
+    var values = try allocator.alloc(ColumnValue, serialTypes.items.len);
+    errdefer allocator.free(values);
+    for (serialTypes.items, 0..) |serial, i| {
+        const value = try readValue(serial.sql_type, serial.serial_type, data[pos..]);
+        values[i] = value.col;
+        pos += value.n;
+    }
+
+    return LeafTableCell{
+        .payload_size = headerSize,
+        .row_id = 1,
+        .column_count = 1,
+        .values = values,
+    };
+}
+
+
+pub fn readVarint(buf: []const u8) !struct { value: u64, size: usize } {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        if (i >= buf.len) {
+            return error.InvalidVarint;
+        }
+        const byte = buf[i];
+        v = (v << @as(u6, 7)) + @as(u64, byte & 0x7f);
+        if ((byte & 0x80) == 0) {
+            return .{
+                .value = v,
+                .size = i + 1,
+            };
+        }
+    }
+    if (8 >= buf.len) {
+        return error.InvalidVarint;
+    }
+    v = (v << @as(u6, 8)) + @as(u64, buf[8]);
+    return .{
+        .value = v,
+        .size = 9,
+    };
+}
+
+
+test "string read varint" {
+    const TestCase = struct {
+        bytes: []const u8,
+        expected_value: ?u64,
+        expected_size: ?usize,
+    };
+
+    const test_cases = [_]TestCase{
+        .{ .bytes = &[_]u8{0x00}, .expected_value = 0, .expected_size = 1 },
+        .{ .bytes = &[_]u8{0x01}, .expected_value = 1, .expected_size = 1 },
+        .{ .bytes = &[_]u8{0x7F}, .expected_value = 127, .expected_size = 1 },
+        .{ .bytes = &[_]u8{ 0x80, 0x01 }, .expected_value = 1, .expected_size = 2 },
+        .{ .bytes = &[_]u8{ 0x81, 0x01 }, .expected_value = 129, .expected_size = 2},
+        .{ .bytes = &[_]u8{ 0xFF, 0x01 }, .expected_value = 16257, .expected_size = 2 },
+        .{ .bytes = &[_]u8{ 0x81, 0x81, 0x01 }, .expected_value = 16513, .expected_size = 3 },
+    };
+
+    for (test_cases) |case| {
+        const result = try readVarint(case.bytes);
+        if (case.expected_value) |expected_value| {
+            const value = result.value;
+            try std.testing.expectEqual(expected_value, value);
+        }
+        if (case.expected_size) |expected_size| {
+            const size = result.size;
+            try std.testing.expectEqual(expected_size, size);
+        }
+    }
+}
+
+test "string read record" {
+    const TestCase = struct {
+        bytes: []const u8,
+        expected_value: ?u64,
+        expected_size: ?usize,
+    };
+    const test_cases = [_]TestCase{
+        .{ .bytes = &[_]u8{
+            0x06, 0x17, 0x17, 0x17, 0x01, 0x79, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x75, 0x73, 0x65, 0x72, 0x73,
+            0x75, 0x73, 0x65, 0x72, 0x73, 0x02, 0x43, 0x52, 0x45, 0x41, 0x54, 0x45, 0x20, 0x54, 0x41, 0x42,
+            0x4c, 0x45, 0x20, 0x75, 0x73, 0x65, 0x72, 0x73, 0x20, 0x28, 0x69, 0x64, 0x20, 0x49, 0x4e, 0x54,
+            0x45, 0x47, 0x45, 0x52, 0x20, 0x50, 0x52, 0x49, 0x4d, 0x41, 0x52, 0x59, 0x20, 0x4b, 0x45, 0x59,
+            0x2c, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x20, 0x54, 0x45, 0x58, 0x54, 0x29},
+            .expected_value = 1, .expected_size = 5 },
+    };
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+    for (test_cases) |case| {
+        const result = try parseRecord(allocator, case.bytes);
+        if (case.expected_value) |expected_value| {
+            try std.testing.expectEqual(expected_value, result.row_id);
+        }
+        if (case.expected_size) |expected_size| {
+            try std.testing.expectEqual(expected_size, result.values.len);
         }
     }
 }
