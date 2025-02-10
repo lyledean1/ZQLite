@@ -3,3 +3,4 @@
 .idea
 *.db
 /db
+.DS_Store
