@@ -180,7 +180,9 @@ pub const Db = struct {
     pub fn open(filename: []const u8, allocator: std.mem.Allocator) !Db {
         const file = try std.fs.cwd().openFile(filename, .{ .mode = .read_only });
         errdefer file.close();
-        return Db{ .file = file, .allocator = allocator};
+        var db = Db{ .file = file, .allocator = allocator};
+        try db.readInfo();
+        return db;
     }
 
     pub fn readInfo(self: *Db) !void {

@@ -16,7 +16,6 @@ pub fn main() !void {
     }
     const file = args[1];
     var db = try sql.Db.open(file, allocator);
-    try db.readInfo();
     const command = args[2];
 
     var tokenizer = Tokenizer.init(command, allocator);
