@@ -416,7 +416,7 @@ const LeafTableCell = struct {
 
         for (self.values[1..]) |value| {
             switch (value) {
-                .Null => std.debug.print("", .{}),
+                .Null => std.debug.print("|", .{}),
                 .Int8 => |v| std.debug.print("|{}", .{v}),
                 .Int16 => |v| std.debug.print("|{}", .{v}),
                 .Int24 => |v| std.debug.print("|{}", .{v}),
@@ -429,8 +429,8 @@ const LeafTableCell = struct {
                 .Blob => |v| std.debug.print("|BLOB({})", .{v.len}),
                 .Text => |v| std.debug.print("|{s}", .{v}),
             }
-            std.debug.print("\n", .{});
         }
+        std.debug.print("\n", .{});
     }
 };
 
