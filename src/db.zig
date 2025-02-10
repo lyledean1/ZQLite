@@ -50,266 +50,6 @@ const PageHeader = struct {
     }
 };
 
-pub const Db = struct {
-    file: std.fs.File,
-    info: ?DbInfo = null,
-
-    pub fn new(filename: []const u8) !Db {
-        const file = try std.fs.cwd().createFile(
-            filename,
-            .{ .read = true, .truncate = true },
-        );
-        errdefer file.close();
-
-        const header = [_]u8{
-            // 0x00-0x0F: Magic header
-            0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66,
-            0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00,
-            // 0x10-0x17: Page size and settings
-            0x10, 0x00, 0x01, 0x01, 0x0c, 0x40, 0x20, 0x20,
-            // 0x18-0x5F: Database settings
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-        };
-
-        // Start of page 1 after header (0x60 onwards)
-        const page1 = [_]u8{
-            0x00, 0x2e, 0x6e, 0xba, @intFromEnum(PageType.leaf_table), 0x00, 0x00, 0x00,
-            0x00, 0x0f, 0xf4, 0x00, 0x00,                              0x00, 0x00, 0x00,
-        };
-
-        try file.writeAll(&header);
-        try file.writeAll(&page1);
-
-        // Fill rest with zeros
-        var remaining: usize = 4096 - (header.len + page1.len);
-        const zeros = [_]u8{0} ** 100;
-        while (remaining > 0) {
-            const to_write = @min(remaining, zeros.len);
-            try file.writeAll(zeros[0..to_write]);
-            remaining -= to_write;
-        }
-
-        return Db{
-            .file = file,
-        };
-    }
-
-    pub fn open(filename: []const u8) !Db {
-        const file = try std.fs.cwd().openFile(filename, .{ .mode = .read_only });
-        errdefer file.close();
-        return Db{ .file = file };
-    }
-
-    pub fn readInfo(self: *Db) !void {
-        self.info = try readDbInfo(self);
-    }
-
-    pub fn get_page(self: *Db, allocator: std.mem.Allocator, page_number: u32) !PageHeader {
-        const info = self.info orelse return error.NoDbInfo;
-        var page_offset: u8 = 0;
-        if (page_number < 1) {
-            return error.InvalidPageNumber;
-        }
-        if (page_number == 1) {
-            page_offset += 100;
-        }
-        // const seek_to = (page_number) * 4096;
-        const page_size: u32 = @intCast(info.databasePageSize);
-        const page = try self.read_range(allocator, (page_size*page_number) - page_size + page_offset, page_size*page_number);
-
-        // see https://www.sqlite.org/fileformat2.html#b_tree_pages for more details
-        var page_header: PageHeader = undefined;
-        const page_type = page[0];
-        page_header.page = page;
-        page_header.page_offset = page_offset;
-        page_header.page_type = page_type;
-        page_header.min_overflow_payload_size = ((info.usablePageSize - 12) * 32 / 255) - 23;
-        page_header.max_overflow_payload_size = try get_max_overload_payload_size(page_type, info.usablePageSize);
-        page_header.first_free_block = std.mem.readInt(u16, page[1..3][0..2], .big);
-        page_header.cell_count = std.mem.readInt(u16, page[3..5][0..2], .big);
-        page_header.start_of_cell_content_area = std.mem.readInt(u16, page[5..7], .big);
-        if (page_header.start_of_cell_content_area == 0) {
-            page_header.start_of_cell_content_area = 65536;
-        }
-        page_header.fragmented_free_bytes = page[7];
-        page_header.cell_pointer_array_offset = 8;
-        if (page_type == 0x02 or page_type == 0x05) {
-                page_header.right_most_pointer = std.mem.readInt(u16, page[8..12][0..2], .big);
-                page_header.cell_pointer_array_offset += 4;
-        }
-        page_header.unallocated_region_size = page_header.start_of_cell_content_area - (page_header.cell_pointer_array_offset + (page_header.cell_count * 2));
-        page_header.cell_pointer_array_offset += page_offset;
-        return page_header;
-    }
-
-    pub fn read_range(self: *Db, allocator:  std.mem.Allocator, from: usize, to: usize) ![]const u8 {
-        const buffer = try allocator.alloc(u8, to - from);
-        try self.file.seekTo(from);
-        const bytes_read = try self.file.readAll(buffer);
-        if (bytes_read != buffer.len) {
-            return error.UnexpectedEOF;
-        }
-        return buffer;
-    }
-
-    pub fn printDbInfo(self: *Db, writer: anytype) !void {
-        const info = self.info orelse return error.NoDbInfo;
-
-        // Get encoding description
-        const encoding_description = switch (info.textEncoding) {
-            1 => " (utf8)",
-            2 => " (utf16le)",
-            3 => " (utf16be)",
-            else => "",
-        };
-
-        // Print all fields
-        try writer.print("database page size:  {d}\n", .{info.databasePageSize});
-        try writer.print("write format:        {d}\n", .{info.writeFormat});
-        try writer.print("read format:         {d}\n", .{info.readFormat});
-        try writer.print("reserved bytes:      {d}\n", .{info.reservedBytes});
-        try writer.print("file change counter: {d}\n", .{info.fileChangeCounter});
-        try writer.print("database page count: {d}\n", .{info.databasePageCount});
-        try writer.print("freelist page count: {d}\n", .{info.freelistPageCount});
-        try writer.print("schema cookie:       {d}\n", .{info.schemaCookie});
-        try writer.print("schema format:       {d}\n", .{info.schemaFormat});
-        try writer.print("default cache size:  {d}\n", .{info.defaultCacheSize});
-        try writer.print("autovacuum top root: {d}\n", .{info.autovacuumTopRoot});
-        try writer.print("incremental vacuum:  {d}\n", .{info.incrementalVacuum});
-        try writer.print("text encoding:       {d}{s}\n", .{ info.textEncoding, encoding_description });
-        try writer.print("user version:        {d}\n", .{info.userVersion});
-        try writer.print("application id:      {d}\n", .{info.applicationId});
-        try writer.print("software version:    {d}\n", .{info.softwareVersion});
-        // try writer.print("number of tables:    {d}\n", .{info.numberOfTables});
-        // try writer.print("number of indexes:   {d}\n", .{info.numberOfIndexes});
-        // try writer.print("number of triggers:  {d}\n", .{info.numberOfTriggers});
-        // try writer.print("number of views:     {d}\n", .{info.numberOfViews});
-        // try writer.print("schema size:         {d}\n", .{info.schemaSize});
-    }
-
-    pub fn scan_table(self: *Db, allocator: std.mem.Allocator, root_page: u32) ![]LeafTableCell {
-        var table_data = std.ArrayList(LeafTableCell).init(allocator);
-        errdefer table_data.deinit();
-        try self.walk_btree_table_pages(allocator, root_page, &table_data);
-        return table_data.toOwnedSlice();
-    }
-
-    fn walk_btree_table_pages(self: *Db, allocator: std.mem.Allocator, page: u32, table_data: *std.ArrayList(LeafTableCell)) !void {
-        const page_header = try self.get_page(allocator, page);
-        switch (page_header.page_type) {
-            0x05 => {
-                return error.NotImplementedForPageType0x05;
-            },
-            0x0d => {
-                const records = try self.walk_leaf_page(allocator, page_header);
-                for (records) |record| {
-                    try table_data.append(record);
-                }
-            },
-            0x02 => {
-                return error.NotImplementedForPageType0x02;
-            },
-            0x0a => {
-                return error.NotImplementedForPageType0x0a;
-            },
-            else => {
-                return error.UnknownPageType;
-            }
-        }
-    }
-
-    fn walk_leaf_page(_: *Db, allocator: std.mem.Allocator, page_header: PageHeader) ![]LeafTableCell {
-        var list = std.ArrayList(LeafTableCell).init(allocator);
-        defer list.deinit(); // Add defer to prevent memory leaks
-
-        if (page_header.page_type != @intFromEnum(PageType.leaf_table)) {
-            return error.NotALeafPage;
-        }
-
-        var cell_index: usize = 0;
-        while (cell_index < page_header.cell_count) : (cell_index += 1) {
-            // Use cell_pointer_array_offset instead of just cell_count
-            const page_offset = page_header.page_offset;
-            const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (cell_index * 2);
-            const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
-            // page_header.print(); add debug field
-            // Use start_of_cell_content_area to ensure we're reading from the correct location
-            const stream = std.io.fixedBufferStream(page_header.page[(cell_offset-page_offset)..]);
-
-            const varint_value = try readVarint(page_header.page[(cell_offset-page_offset)..]);
-            const payload_size = varint_value.value;
-            const start = cell_offset + stream.pos;
-            const end = start + @as(usize, @intCast(payload_size));
-            // Calculate payload position using current stream position
-            const payload_data = page_header.page[(start-page_offset) + 2 .. (end-page_offset) + 2];
-
-            const record = try parseRecord(allocator, payload_data);
-            try list.append(record);
-        }
-
-        return list.toOwnedSlice();
-    }
-
-    pub fn deinit(self: *Db) void {
-        self.file.close();
-    }
-};
-
-fn readDbInfo(db: *Db) !DbInfo {
-    var header: [100]u8 = undefined;
-    const bytes_read = try db.file.read(&header);
-    if (bytes_read != header.len) {
-        return error.InvalidRead;
-    }
-
-    // Check SQLite header magic string
-    const magic = "SQLite format 3\x00";
-    if (!mem.eql(u8, header[0..16], magic)) {
-        return error.InvalidSqliteFile;
-    }
-
-    // Read page size (big endian u16)
-    var info: DbInfo = undefined;
-    const page_size = mem.readInt(u16, header[16..18], .big);
-    info.databasePageSize = if (page_size == 1) 65536 else page_size;
-
-    // Read individual bytes
-    info.writeFormat = header[18];
-    info.readFormat = header[19];
-    info.reservedBytes = header[20];
-    info.maxEmbeddedPayloadFraction = header[21];
-    info.minEmbeddedPayloadFraction = header[22];
-    info.leafPayloadFraction = header[23];
-
-    // Read big endian u32 values
-    info.fileChangeCounter = mem.readInt(u32, header[24..28], .big);
-    info.databasePageCount = mem.readInt(u32, header[28..32], .big);
-    info.firstFreeListPage = mem.readInt(u32, header[32..36], .big);
-    info.freelistPageCount = mem.readInt(u32, header[36..40], .big);
-    info.schemaCookie = mem.readInt(u32, header[40..44], .big);
-    info.schemaFormat = mem.readInt(u32, header[44..48], .big);
-    info.defaultCacheSize = mem.readInt(u32, header[48..52], .big);
-    info.autovacuumTopRoot = mem.readInt(u32, header[52..56], .big);
-    info.textEncoding = mem.readInt(u32, header[56..60], .big);
-    info.userVersion = mem.readInt(u32, header[60..64], .big);
-    info.incrementalVacuum = mem.readInt(u32, header[64..68], .big);
-    info.applicationId = mem.readInt(u32, header[68..72], .big);
-    info.versionValidForNumber = mem.readInt(u32, header[92..96], .big);
-    info.softwareVersion = mem.readInt(u32, header[96..100], .big);
-
-    // Calculate usable page size
-    info.usablePageSize = @intCast(info.databasePageSize - info.reservedBytes);
-
-    return info;
-}
 
 const DbInfo = struct {
     databasePageSize: i32,
@@ -341,14 +81,19 @@ const DbInfo = struct {
     usablePageSize: u32,
 };
 
-const SchemaEntry = struct { schemaType: []const u8, name: []const u8, tableName: []const u8, rootPage: u8, columns: []ColumnDef, constraints: [][]const u8 };
-const ColumnDef = struct { name: []const u8, columnType: []const u8, constraints: [][]const u8 };
-const TableRecord = struct {
+const SchemaEntry = struct {
+    schemaType: []const u8,
+    name: []const u8,
+    tableName: []const u8,
+    rootPage: i8,
+    sql: []const u8,
 
+    pub fn print(self: SchemaEntry) void {
+        std.debug.print("{s};\n", .{self.sql});
+    }
 };
-pub const TableRawRecord = {};
-pub const InteriorTableEntry = {};
-pub const InteriorIndexEntry = {};
+
+const ColumnDef = struct { name: []const u8, columnType: []const u8, constraints: [][]const u8 };
 
 const SqliteType = enum(u8) {
     Null = 0,
@@ -380,6 +125,282 @@ const ColumnValue = union(SqliteType) {
     Text: []const u8,
 };
 
+pub const Db = struct {
+    file: std.fs.File,
+    allocator: std.mem.Allocator,
+    info: ?DbInfo = null,
+    schemas: ?[]SchemaEntry = null,
+
+    pub fn new(filename: []const u8, allocator: std.mem.Allocator) !Db {
+        const file = try std.fs.cwd().createFile(
+            filename,
+            .{ .read = true, .truncate = true },
+        );
+        errdefer file.close();
+
+        const header = [_]u8{
+            0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66,
+            0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00,
+            0x10, 0x00, 0x01, 0x01, 0x0c, 0x40, 0x20, 0x20,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+        };
+
+        // Start of page 1 after header (0x60 onwards)
+        const page1 = [_]u8{
+            0x00, 0x2e, 0x6e, 0xba, @intFromEnum(PageType.leaf_table), 0x00, 0x00, 0x00,
+            0x00, 0x0f, 0xf4, 0x00, 0x00,                              0x00, 0x00, 0x00,
+        };
+
+        try file.writeAll(&header);
+        try file.writeAll(&page1);
+
+        // Fill rest with zeros
+        var remaining: usize = 4096 - (header.len + page1.len);
+        const zeros = [_]u8{0} ** 100;
+        while (remaining > 0) {
+            const to_write = @min(remaining, zeros.len);
+            try file.writeAll(zeros[0..to_write]);
+            remaining -= to_write;
+        }
+
+        return Db{
+            .file = file,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn open(filename: []const u8, allocator: std.mem.Allocator) !Db {
+        const file = try std.fs.cwd().openFile(filename, .{ .mode = .read_only });
+        errdefer file.close();
+        return Db{ .file = file, .allocator = allocator};
+    }
+
+    pub fn readInfo(self: *Db) !void {
+        self.info = try readDbInfo(self);
+        self.schemas = try self.read_schema();
+    }
+
+    pub fn get_page(self: *Db, page_number: u32) !PageHeader {
+        const info = self.info orelse return error.NoDbInfo;
+        var page_offset: u8 = 0;
+        if (page_number < 1) {
+            return error.InvalidPageNumber;
+        }
+        if (page_number == 1) {
+            page_offset += 100;
+        }
+
+        const page_size: u32 = @intCast(info.databasePageSize);
+        const page = try self.read_range((page_size * page_number) - page_size + page_offset, page_size * page_number);
+
+        // see https://www.sqlite.org/fileformat2.html#b_tree_pages for more details
+        var page_header: PageHeader = undefined;
+        const page_type = page[0];
+        page_header.page = page;
+        page_header.page_offset = page_offset;
+        page_header.page_type = page_type;
+        page_header.min_overflow_payload_size = ((info.usablePageSize - 12) * 32 / 255) - 23;
+        page_header.max_overflow_payload_size = try get_max_overload_payload_size(page_type, info.usablePageSize);
+        page_header.first_free_block = std.mem.readInt(u16, page[1..3][0..2], .big);
+        page_header.cell_count = std.mem.readInt(u16, page[3..5][0..2], .big);
+        page_header.start_of_cell_content_area = std.mem.readInt(u16, page[5..7], .big);
+        if (page_header.start_of_cell_content_area == 0) {
+            page_header.start_of_cell_content_area = 65536;
+        }
+        page_header.fragmented_free_bytes = page[7];
+        page_header.cell_pointer_array_offset = 8;
+        if (page_type == 0x02 or page_type == 0x05) {
+            page_header.right_most_pointer = std.mem.readInt(u16, page[8..12][0..2], .big);
+            page_header.cell_pointer_array_offset += 4;
+        }
+        page_header.unallocated_region_size = page_header.start_of_cell_content_area - (page_header.cell_pointer_array_offset + (page_header.cell_count * 2));
+        page_header.cell_pointer_array_offset += page_offset;
+        return page_header;
+    }
+
+    pub fn read_range(self: *Db, from: usize, to: usize) ![]const u8 {
+        const buffer = try self.allocator.alloc(u8, to - from);
+        try self.file.seekTo(from);
+        const bytes_read = try self.file.readAll(buffer);
+        if (bytes_read != buffer.len) {
+            return error.UnexpectedEOF;
+        }
+        return buffer;
+    }
+
+    pub fn printDbInfo(self: *Db, writer: anytype) !void {
+        const info = self.info orelse return error.NoDbInfo;
+
+        // Get encoding description
+        const encoding_description = switch (info.textEncoding) {
+            1 => " (utf8)",
+            2 => " (utf16le)",
+            3 => " (utf16be)",
+            else => "",
+        };
+
+        try writer.print("database page size:  {d}\n", .{info.databasePageSize});
+        try writer.print("write format:        {d}\n", .{info.writeFormat});
+        try writer.print("read format:         {d}\n", .{info.readFormat});
+        try writer.print("reserved bytes:      {d}\n", .{info.reservedBytes});
+        try writer.print("file change counter: {d}\n", .{info.fileChangeCounter});
+        try writer.print("database page count: {d}\n", .{info.databasePageCount});
+        try writer.print("freelist page count: {d}\n", .{info.freelistPageCount});
+        try writer.print("schema cookie:       {d}\n", .{info.schemaCookie});
+        try writer.print("schema format:       {d}\n", .{info.schemaFormat});
+        try writer.print("default cache size:  {d}\n", .{info.defaultCacheSize});
+        try writer.print("autovacuum top root: {d}\n", .{info.autovacuumTopRoot});
+        try writer.print("incremental vacuum:  {d}\n", .{info.incrementalVacuum});
+        try writer.print("text encoding:       {d}{s}\n", .{ info.textEncoding, encoding_description });
+        try writer.print("user version:        {d}\n", .{info.userVersion});
+        try writer.print("application id:      {d}\n", .{info.applicationId});
+        try writer.print("software version:    {d}\n", .{info.softwareVersion});
+        try writer.print("number of tables:    {d}\n", .{info.numberOfTables});
+        try writer.print("number of indexes:   {d}\n", .{info.numberOfIndexes});
+        try writer.print("number of triggers:  {d}\n", .{info.numberOfTriggers});
+        try writer.print("number of views:     {d}\n", .{info.numberOfViews});
+        try writer.print("schema size:         {d}\n", .{info.schemaSize});
+    }
+
+    pub fn printSchemas(self: *Db) !void {
+        const schemas = self.schemas orelse return error.NoSchemas;
+        for (schemas) |schema| {
+            schema.print();
+        }
+    }
+
+    pub fn printTables(self: *Db, writer: anytype) !void {
+        const schemas = self.schemas orelse return error.NoTables;
+        for (schemas) |schema| {
+            try writer.print("{s} ", .{schema.tableName});
+        }
+        try writer.print("{s}", .{"\n"});
+    }
+
+    pub fn read_schema(self: *Db) ![]SchemaEntry {
+        const records = try self.scan_table(1);
+        var values = try self.allocator.alloc(SchemaEntry, records.len);
+        for (records, 0..) |record, i| {
+            const value = record.values;
+            const entry = SchemaEntry{ .schemaType = value[0].Text, .name = value[1].Text, .tableName = value[2].Text, .rootPage = value[3].Int8, .sql = value[4].Text };
+            values[i] = entry;
+        }
+        return values;
+    }
+
+    pub fn scan_table(self: *Db, root_page: u32) ![]LeafTableCell {
+        var table_data = std.ArrayList(LeafTableCell).init(self.allocator);
+        errdefer table_data.deinit();
+        try self.walk_btree_table_pages(root_page, &table_data);
+        return table_data.toOwnedSlice();
+    }
+
+    fn walk_btree_table_pages(self: *Db, page: u32, table_data: *std.ArrayList(LeafTableCell)) !void {
+        const page_header = try self.get_page(page);
+        switch (page_header.page_type) {
+            0x05 => {
+                return error.NotImplementedForPageType0x05;
+            },
+            0x0d => {
+                const records = try self.walk_leaf_page(page_header);
+                for (records) |record| {
+                    try table_data.append(record);
+                }
+            },
+            0x02 => {
+                return error.NotImplementedForPageType0x02;
+            },
+            0x0a => {
+                return error.NotImplementedForPageType0x0a;
+            },
+            else => {
+                return error.UnknownPageType;
+            },
+        }
+    }
+
+    fn walk_leaf_page(self: *Db, page_header: PageHeader) ![]LeafTableCell {
+        var list = std.ArrayList(LeafTableCell).init(self.allocator);
+        defer list.deinit(); // Add defer to prevent memory leaks
+
+        if (page_header.page_type != @intFromEnum(PageType.leaf_table)) {
+            return error.NotALeafPage;
+        }
+
+        var cell_index: usize = 0;
+        while (cell_index < page_header.cell_count) : (cell_index += 1) {
+            const page_offset = page_header.page_offset;
+            const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (cell_index * 2);
+            const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
+            const stream = std.io.fixedBufferStream(page_header.page[(cell_offset - page_offset)..]);
+
+            const varint_value = try readVarint(page_header.page[(cell_offset - page_offset)..]);
+            const payload_size = varint_value.value;
+            const start = cell_offset + stream.pos;
+            const end = start + @as(usize, @intCast(payload_size));
+            const row_id = page_header.page[(start - page_offset) + 1];
+            const payload_data = page_header.page[(start - page_offset) + 2 .. (end - page_offset) + 2];
+            const record = try parseRecord(self.allocator, payload_data, row_id);
+            try list.append(record);
+        }
+
+        return list.toOwnedSlice();
+    }
+
+    pub fn deinit(self: *Db) void {
+        self.file.close();
+    }
+};
+
+fn readDbInfo(db: *Db) !DbInfo {
+    var header: [100]u8 = undefined;
+    const bytes_read = try db.file.read(&header);
+    if (bytes_read != header.len) {
+        return error.InvalidRead;
+    }
+
+    const magic = "SQLite format 3\x00";
+    if (!mem.eql(u8, header[0..16], magic)) {
+        return error.InvalidSqliteFile;
+    }
+
+    var info: DbInfo = undefined;
+    const page_size = mem.readInt(u16, header[16..18], .big);
+    info.databasePageSize = if (page_size == 1) 65536 else page_size;
+
+    info.writeFormat = header[18];
+    info.readFormat = header[19];
+    info.reservedBytes = header[20];
+    info.maxEmbeddedPayloadFraction = header[21];
+    info.minEmbeddedPayloadFraction = header[22];
+    info.leafPayloadFraction = header[23];
+    info.fileChangeCounter = mem.readInt(u32, header[24..28], .big);
+    info.databasePageCount = mem.readInt(u32, header[28..32], .big);
+    info.firstFreeListPage = mem.readInt(u32, header[32..36], .big);
+    info.freelistPageCount = mem.readInt(u32, header[36..40], .big);
+    info.schemaCookie = mem.readInt(u32, header[40..44], .big);
+    info.schemaFormat = mem.readInt(u32, header[44..48], .big);
+    info.defaultCacheSize = mem.readInt(u32, header[48..52], .big);
+    info.autovacuumTopRoot = mem.readInt(u32, header[52..56], .big);
+    info.textEncoding = mem.readInt(u32, header[56..60], .big);
+    info.userVersion = mem.readInt(u32, header[60..64], .big);
+    info.incrementalVacuum = mem.readInt(u32, header[64..68], .big);
+    info.applicationId = mem.readInt(u32, header[68..72], .big);
+    info.versionValidForNumber = mem.readInt(u32, header[92..96], .big);
+    info.softwareVersion = mem.readInt(u32, header[96..100], .big);
+    info.usablePageSize = @intCast(info.databasePageSize - info.reservedBytes);
+
+    return info;
+}
+
 const LeafTableCell = struct {
     payload_size: u64,
     row_id: u64,
@@ -391,31 +412,29 @@ const LeafTableCell = struct {
     }
 
     pub fn print(self: LeafTableCell) void {
-        std.debug.print("Record ID: {}\n", .{self.row_id});
-        std.debug.print("Column count: {}\n", .{self.column_count});
+        std.debug.print("{}", .{self.row_id});
 
-        for (self.values, 0..) |value, i| {
-            std.debug.print("Column {}: ", .{i});
+        for (self.values[1..]) |value| {
             switch (value) {
-                .Null => std.debug.print("NULL", .{}),
-                .Int8 => |v| std.debug.print("{}", .{v}),
-                .Int16 => |v| std.debug.print("{}", .{v}),
-                .Int24 => |v| std.debug.print("{}", .{v}),
-                .Int32 => |v| std.debug.print("{}", .{v}),
-                .Int48 => |v| std.debug.print("{}", .{v}),
-                .Int64 => |v| std.debug.print("{}", .{v}),
+                .Null => std.debug.print("", .{}),
+                .Int8 => |v| std.debug.print("|{}", .{v}),
+                .Int16 => |v| std.debug.print("|{}", .{v}),
+                .Int24 => |v| std.debug.print("|{}", .{v}),
+                .Int32 => |v| std.debug.print("|{}", .{v}),
+                .Int48 => |v| std.debug.print("|{}", .{v}),
+                .Int64 => |v| std.debug.print("|{}", .{v}),
                 .Float64 => |v| std.debug.print("{d}", .{v}),
-                .Zero => std.debug.print("0", .{}),
-                .One => std.debug.print("1", .{}),
-                .Blob => |v| std.debug.print("BLOB({})", .{v.len}),
-                .Text => |v| std.debug.print("'{s}'", .{v}),
+                .Zero => std.debug.print("|0", .{}),
+                .One => std.debug.print("|1", .{}),
+                .Blob => |v| std.debug.print("|BLOB({})", .{v.len}),
+                .Text => |v| std.debug.print("|{s}", .{v}),
             }
             std.debug.print("\n", .{});
         }
     }
 };
 
-const SerialTypeInfo = struct { sql_type: SqliteType, serial_type: u64};
+const SerialTypeInfo = struct { sql_type: SqliteType, serial_type: u64 };
 
 fn getTypeAndSizeFromSerial(serial_type: u64) !SerialTypeInfo {
     const sqlite_type = try getTypeFromSerial(serial_type);
@@ -447,64 +466,47 @@ fn getTypeFromSerial(serial_type: u64) !SqliteType {
     };
 }
 
-fn readValue(typ: SqliteType, serial_type: u64, data: []const u8) !struct{col: ColumnValue, n: u64} {
+fn readValue(typ: SqliteType, serial_type: u64, data: []const u8) !struct { col: ColumnValue, n: u64 } {
     var stream = std.io.fixedBufferStream(data);
     var reader = stream.reader();
 
     return switch (typ) {
-        .Null => .{.col=ColumnValue{ .Null = {}}, .n = 0 },
-        .Int8 => .{.col= ColumnValue{.Int8 = @as(i8, @bitCast(try reader.readByte())) },.n = 1},
-        .Int16 => .{ .col=ColumnValue{.Int16 = try reader.readInt(i16, .big) },.n = 2},
+        .Null => .{ .col = ColumnValue{ .Null = {} }, .n = 0 },
+        .Int8 => .{ .col = ColumnValue{ .Int8 = @as(i8, @bitCast(try reader.readByte())) }, .n = 1 },
+        .Int16 => .{ .col = ColumnValue{ .Int16 = try reader.readInt(i16, .big) }, .n = 2 },
         .Int24 => {
             var bytes: [3]u8 = undefined;
             _ = try reader.readAll(&bytes);
             const val = std.mem.readInt(i24, &bytes, .big);
-            return .{ .col=ColumnValue{.Int24 = val },.n = 3};
+            return .{ .col = ColumnValue{ .Int24 = val }, .n = 3 };
         },
-        .Int32 => .{ .col=ColumnValue{.Int32 = try reader.readInt(i32, .big) },.n = 4},
+        .Int32 => .{ .col = ColumnValue{ .Int32 = try reader.readInt(i32, .big) }, .n = 4 },
         .Int48 => {
             var bytes: [6]u8 = undefined;
             _ = try reader.readAll(&bytes);
             const val = std.mem.readInt(i48, &bytes, .big);
-            return .{.col=ColumnValue{ .Int48 = val },.n = 6};
+            return .{ .col = ColumnValue{ .Int48 = val }, .n = 6 };
         },
-        .Int64 => .{.col=ColumnValue{ .Int64 = try reader.readInt(i64, .big) },.n = 8},
+        .Int64 => .{ .col = ColumnValue{ .Int64 = try reader.readInt(i64, .big) }, .n = 8 },
         .Float64 => {
             var bytes: [8]u8 = undefined;
             _ = try reader.readAll(&bytes);
             const val = std.mem.readInt(u64, &bytes, .big);
-            return .{.col=ColumnValue{  .Float64 = @bitCast(val) },.n = 8};
+            return .{ .col = ColumnValue{ .Float64 = @bitCast(val) }, .n = 8 };
         },
-        .Zero => .{.col=ColumnValue{ .Zero = {}}, .n =0},
-        .One => .{.col=ColumnValue{ .One = {} }, .n =1},
+        .Zero => .{ .col = ColumnValue{ .Zero = {} }, .n = 0 },
+        .One => .{ .col = ColumnValue{ .One = {} }, .n = 1 },
         .Text => {
             const len = (serial_type - 13) / 2;
             const start_pos = stream.pos;
             const text_slice = data[start_pos..][0..@intCast(len)];
             try stream.seekBy(@intCast(len));
-            return .{.col=ColumnValue{  .Text = text_slice}, .n = len };
+            return .{ .col = ColumnValue{ .Text = text_slice }, .n = len };
         },
         .Blob => {
             @panic("Blob not implemented yet");
         },
     };
-}
-
-pub fn printColumnValue(value: ColumnValue) void {
-    switch (value) {
-        .Null => std.debug.print("NULL\n", .{}),
-        .Int8 => |v| std.debug.print("Int8: {}\n", .{v}),
-        .Int16 => |v| std.debug.print("Int16: {}\n", .{v}),
-        .Int24 => |v| std.debug.print("Int24: {}\n", .{v}),
-        .Int32 => |v| std.debug.print("Int32: {}\n", .{v}),
-        .Int48 => |v| std.debug.print("Int48: {}\n", .{v}),
-        .Int64 => |v| std.debug.print("Int64: {}\n", .{v}),
-        .Float64 => |v| std.debug.print("Float64: {d}\n", .{v}),
-        .Zero => std.debug.print("Zero\n", .{}),
-        .One => std.debug.print("One\n", .{}),
-        .Blob => |v| std.debug.print("Blob: {any}\n", .{v}),
-        .Text => |v| std.debug.print("Text: {s}\n", .{v}),
-    }
 }
 
 fn get_max_overload_payload_size(page_type: u32, usable_page_size: u32) !u32 {
@@ -517,11 +519,11 @@ fn get_max_overload_payload_size(page_type: u32, usable_page_size: u32) !u32 {
         },
         else => {
             return error.InvalidPageSize;
-        }
+        },
     }
 }
 
-fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
+fn parseRecord(allocator: std.mem.Allocator, data: []const u8, row_id: u8) !LeafTableCell {
     var pos: usize = 0;
     const varintHeader = try readVarint(data);
     var headerSize = varintHeader.value;
@@ -553,12 +555,11 @@ fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
 
     return LeafTableCell{
         .payload_size = headerSize,
-        .row_id = 1,
+        .row_id = row_id,
         .column_count = 1,
         .values = values,
     };
 }
-
 
 pub fn readVarint(buf: []const u8) !struct { value: u64, size: usize } {
     var v: u64 = 0;
@@ -586,7 +587,6 @@ pub fn readVarint(buf: []const u8) !struct { value: u64, size: usize } {
     };
 }
 
-
 test "string read varint" {
     const TestCase = struct {
         bytes: []const u8,
@@ -599,7 +599,7 @@ test "string read varint" {
         .{ .bytes = &[_]u8{0x01}, .expected_value = 1, .expected_size = 1 },
         .{ .bytes = &[_]u8{0x7F}, .expected_value = 127, .expected_size = 1 },
         .{ .bytes = &[_]u8{ 0x80, 0x01 }, .expected_value = 1, .expected_size = 2 },
-        .{ .bytes = &[_]u8{ 0x81, 0x01 }, .expected_value = 129, .expected_size = 2},
+        .{ .bytes = &[_]u8{ 0x81, 0x01 }, .expected_value = 129, .expected_size = 2 },
         .{ .bytes = &[_]u8{ 0xFF, 0x01 }, .expected_value = 16257, .expected_size = 2 },
         .{ .bytes = &[_]u8{ 0x81, 0x81, 0x01 }, .expected_value = 16513, .expected_size = 3 },
     };
@@ -617,26 +617,23 @@ test "string read varint" {
     }
 }
 
-test "string read record" {
+test "read records" {
     const TestCase = struct {
+        name: []const u8,
         bytes: []const u8,
         expected_value: ?u64,
         expected_size: ?usize,
     };
     const test_cases = [_]TestCase{
-        .{ .bytes = &[_]u8{
-            0x06, 0x17, 0x17, 0x17, 0x01, 0x79, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x75, 0x73, 0x65, 0x72, 0x73,
-            0x75, 0x73, 0x65, 0x72, 0x73, 0x02, 0x43, 0x52, 0x45, 0x41, 0x54, 0x45, 0x20, 0x54, 0x41, 0x42,
-            0x4c, 0x45, 0x20, 0x75, 0x73, 0x65, 0x72, 0x73, 0x20, 0x28, 0x69, 0x64, 0x20, 0x49, 0x4e, 0x54,
-            0x45, 0x47, 0x45, 0x52, 0x20, 0x50, 0x52, 0x49, 0x4d, 0x41, 0x52, 0x59, 0x20, 0x4b, 0x45, 0x59,
-            0x2c, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x20, 0x54, 0x45, 0x58, 0x54, 0x29},
-            .expected_value = 1, .expected_size = 5 },
+        .{ .name = "read schema", .bytes = &[_]u8{ 0x06, 0x17, 0x17, 0x17, 0x01, 0x79, 0x74, 0x61, 0x62, 0x6c, 0x65, 0x75, 0x73, 0x65, 0x72, 0x73, 0x75, 0x73, 0x65, 0x72, 0x73, 0x02, 0x43, 0x52, 0x45, 0x41, 0x54, 0x45, 0x20, 0x54, 0x41, 0x42, 0x4c, 0x45, 0x20, 0x75, 0x73, 0x65, 0x72, 0x73, 0x20, 0x28, 0x69, 0x64, 0x20, 0x49, 0x4e, 0x54, 0x45, 0x47, 0x45, 0x52, 0x20, 0x50, 0x52, 0x49, 0x4d, 0x41, 0x52, 0x59, 0x20, 0x4b, 0x45, 0x59, 0x2c, 0x20, 0x6e, 0x61, 0x6d, 0x65, 0x20, 0x54, 0x45, 0x58, 0x54, 0x29 }, .expected_value = 1, .expected_size = 5 },
+        .{ .name = "read value", .bytes = &[_]u8{ 0x04, 0x00, 0x1b, 0x00, 0x45, 0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x0b, 0x01 }, .expected_value = 1, .expected_size = 3 },
     };
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     for (test_cases) |case| {
-        const result = try parseRecord(allocator, case.bytes);
+        const row_id: u8 = @intCast(case.expected_value orelse 0);
+        const result = try parseRecord(allocator, case.bytes, row_id);
         if (case.expected_value) |expected_value| {
             try std.testing.expectEqual(expected_value, result.row_id);
         }

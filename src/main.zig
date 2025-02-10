@@ -1,6 +1,7 @@
 const std = @import("std");
-const parser = @import("tokenizer.zig");
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const sql = @import("db.zig");
+const Parser = @import("parser.zig").Parser;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -9,34 +10,19 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    if (args.len < 2) {
-        std.debug.print("Usage: {s} <file> \n", .{args[0]});
+    if (args.len < 3) {
+        std.debug.print("Usage: {s} <file> <sql> \n", .{args[0]});
         return;
     }
     const file = args[1];
-    // var tokenizer = parser.Tokenizer.init(expr, allocator);
-    // const tokens = try tokenizer.tokenize();
-    //
-    // for (tokens.items) |str| {
-    //     std.debug.print("{s}\n", .{str.value});
-    // }
-
-    var db = try sql.Db.open(file);
+    var db = try sql.Db.open(file, allocator);
     try db.readInfo();
-    try db.printDbInfo(std.io.getStdOut().writer());
-    const records = try db.scan_table(allocator, 1);
-    for (records) |record| {
-        // record.print();
-        for (record.values) |value| {
-            sql.printColumnValue(value);
-        }
-    }
-    const records_two = try db.scan_table(allocator, 2);
-    for (records_two) |record| {
-        // record.print();
-        for (record.values) |value| {
-            sql.printColumnValue(value);
-        }
-    }
+    const command = args[2];
+
+    var tokenizer = Tokenizer.init(command, allocator);
+    var tokens = try tokenizer.tokenize();
+    defer tokens.deinit();
+    var parser = Parser.init(tokens, allocator, db);
+    try parser.parse();
     defer db.deinit();
 }

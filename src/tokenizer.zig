@@ -4,6 +4,7 @@ const testing = std.testing;
 const ArrayList = std.ArrayList;
 
 pub const TokenType = enum {
+    Command,
     Keyword,
     Identifier,
     String,
@@ -28,6 +29,10 @@ pub const Token = struct {
             .column = column,
         };
     }
+
+    pub fn tokenType(self: *Token) TokenType {
+        return self.type;
+    }
 };
 
 pub const Tokenizer = struct {
@@ -48,6 +53,12 @@ pub const Tokenizer = struct {
         .{ "DELETE", {} },
         .{ "AND", {} },
         .{ "OR", {} },
+    });
+
+    const commands = StaticStringMap(void).initComptime(.{
+        .{".dbinfo", {}},
+        .{".tables", {}},
+        .{".schema", {}}
     });
 
     pub fn init(input: []const u8, allocator: std.mem.Allocator) Tokenizer {
@@ -74,6 +85,10 @@ pub const Tokenizer = struct {
             self.column += 1;
         }
         self.pos += 1;
+    }
+
+    fn isPeriod(c: u8) bool {
+        return c == '.';
     }
 
     fn isWhitespace(c: u8) bool {
@@ -105,6 +120,14 @@ pub const Tokenizer = struct {
         const current = self.peek() orelse {
             return Token.init(TokenType.EOF, "", start_line, start_column);
         };
+
+        if (isPeriod(current) and start_pos == 0) {
+            while (self.peek()) |c| {
+                if (!isAlpha(c) and c != '.') break;
+                self.advance();
+            }
+            return Token.init(TokenType.Command, self.input[start_pos..self.pos], start_line, start_column);
+        }
 
         if (isAlpha(current)) {
             while (self.peek()) |c| {
@@ -202,5 +225,23 @@ test "string literal tokenization" {
             break;
         }
     }
+    try testing.expect(found_string);
+}
+
+test "command tokenization" {
+    const allocator = testing.allocator;
+    const input = ".dbinfo;";
+    var tokenizer = Tokenizer.init(input, allocator);
+    var tokens = try tokenizer.tokenize();
+    defer tokens.deinit();
+
+    var found_string = false;
+    for (tokens.items) |token| {
+        if (token.type == TokenType.Command and std.mem.eql(u8, token.value, ".dbinfo")) {
+            found_string = true;
+            break;
+        }
+    }
+    try testing.expectEqual(tokens.items.len, 3);
     try testing.expect(found_string);
 }
