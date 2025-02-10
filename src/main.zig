@@ -15,9 +15,9 @@ pub fn main() !void {
         return;
     }
     const file = args[1];
-    var db = try sql.Db.open(file, allocator);
     const command = args[2];
 
+    var db = try sql.Db.open(file, allocator);
     var tokenizer = Tokenizer.init(command, allocator);
     var tokens = try tokenizer.tokenize();
     defer tokens.deinit();
