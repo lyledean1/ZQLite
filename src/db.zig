@@ -240,21 +240,16 @@ pub const Db = struct {
             const page_offset = page_header.page_offset;
             const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (cell_index * 2);
             const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
-            std.debug.print("\nCell {}: offset=0x{x:0>4} pointer offset={}\n", .{cell_index, cell_offset, pointer_offset});
-            page_header.print();
+            // page_header.print(); add debug field
             // Use start_of_cell_content_area to ensure we're reading from the correct location
             const stream = std.io.fixedBufferStream(page_header.page[(cell_offset-page_offset)..]);
 
             const varint_value = try readVarint(page_header.page[(cell_offset-page_offset)..]);
             const payload_size = varint_value.value;
-            const varint_row_id = try readVarint(page_header.page[(cell_offset-page_offset)..]); // row id
-            const id = varint_row_id.value;
             const start = cell_offset + stream.pos;
             const end = start + @as(usize, @intCast(payload_size));
-            std.debug.print("\nstart {} end {} id {} payload_size {} and len {}\n", .{start-page_offset, end-page_offset, id, payload_size, page_header.page.len});
-
             // Calculate payload position using current stream position
-            const payload_data = page_header.page[(start-page_offset) .. (end-page_offset) - 1];
+            const payload_data = page_header.page[(start-page_offset) + 2 .. (end-page_offset) + 2];
 
             const record = try parseRecord(allocator, payload_data);
             try list.append(record);
@@ -528,17 +523,14 @@ fn get_max_overload_payload_size(page_type: u32, usable_page_size: u32) !u32 {
 
 fn parseRecord(allocator: std.mem.Allocator, data: []const u8) !LeafTableCell {
     var pos: usize = 0;
-    std.debug.print("Here: \n", .{});
     const varintHeader = try readVarint(data);
     var headerSize = varintHeader.value;
-    std.debug.print("Size: {}\n", .{headerSize});
     var nr = varintHeader.size;
     assert(headerSize >= nr);
     headerSize = headerSize - nr;
     pos += nr;
     var serialTypes = std.ArrayList(SerialTypeInfo).init(allocator);
     errdefer serialTypes.deinit();
-    std.debug.print("Size: {}\n", .{headerSize});
 
     while (headerSize > 0) {
         const currentPayload = data[pos..];

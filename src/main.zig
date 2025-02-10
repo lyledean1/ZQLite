@@ -26,17 +26,17 @@ pub fn main() !void {
     try db.printDbInfo(std.io.getStdOut().writer());
     const records = try db.scan_table(allocator, 1);
     for (records) |record| {
-        record.print();
-        // for (record.values) |value| {
-        //     sql.printColumnValue(value);
-        // }
+        // record.print();
+        for (record.values) |value| {
+            sql.printColumnValue(value);
+        }
     }
-    // const records_two = try db.scan_table(allocator, 2);
-    // for (records_two) |record| {
-    //     record.print();
-    //     // for (record.values) |value| {
-    //     //     sql.printColumnValue(value);
-    //     // }
-    // }
+    const records_two = try db.scan_table(allocator, 2);
+    for (records_two) |record| {
+        // record.print();
+        for (record.values) |value| {
+            sql.printColumnValue(value);
+        }
+    }
     defer db.deinit();
 }
