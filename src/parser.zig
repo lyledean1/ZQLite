@@ -21,7 +21,7 @@ pub const Parser = struct {
       if (current_token.tokenType() == TokenType.Command) {
          try executeCommand(self, current_token);
       }
-      if (current_token.tokenType() == TokenType.Keyword and std.mem.eql(u8, current_token.value, "SELECT")) {
+      if (current_token.tokenType() == TokenType.Keyword and std.ascii.eqlIgnoreCase(current_token.value, "SELECT")) {
          try executeSelect(self, 0);
       }
    }
@@ -30,7 +30,7 @@ pub const Parser = struct {
       if (std.mem.eql(u8, command.value, ".dbinfo")) {
          try self.db.printDbInfo(std.io.getStdOut().writer());
       }
-      if (std.mem.eql(u8, command.value, ".schemas")) {
+      if (std.mem.eql(u8, command.value, ".schema")) {
          try self.db.printSchemas();
       }
       if (std.mem.eql(u8, command.value, ".tables")) {
