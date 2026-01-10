@@ -238,7 +238,7 @@ pub const Db = struct {
         return buffer;
     }
 
-    pub fn printDbInfo(self: *Db, writer: anytype) !void {
+    pub fn printDbInfo(self: *Db) !void {
         const info = self.info orelse return error.NoDbInfo;
 
         // Get encoding description
@@ -249,27 +249,27 @@ pub const Db = struct {
             else => "",
         };
 
-        try writer.print("database page size:  {d}\n", .{info.databasePageSize});
-        try writer.print("write format:        {d}\n", .{info.writeFormat});
-        try writer.print("read format:         {d}\n", .{info.readFormat});
-        try writer.print("reserved bytes:      {d}\n", .{info.reservedBytes});
-        try writer.print("file change counter: {d}\n", .{info.fileChangeCounter});
-        try writer.print("database page count: {d}\n", .{info.databasePageCount});
-        try writer.print("freelist page count: {d}\n", .{info.freelistPageCount});
-        try writer.print("schema cookie:       {d}\n", .{info.schemaCookie});
-        try writer.print("schema format:       {d}\n", .{info.schemaFormat});
-        try writer.print("default cache size:  {d}\n", .{info.defaultCacheSize});
-        try writer.print("autovacuum top root: {d}\n", .{info.autovacuumTopRoot});
-        try writer.print("incremental vacuum:  {d}\n", .{info.incrementalVacuum});
-        try writer.print("text encoding:       {d}{s}\n", .{ info.textEncoding, encoding_description });
-        try writer.print("user version:        {d}\n", .{info.userVersion});
-        try writer.print("application id:      {d}\n", .{info.applicationId});
-        try writer.print("software version:    {d}\n", .{info.softwareVersion});
-        try writer.print("number of tables:    {d}\n", .{info.numberOfTables});
-        try writer.print("number of indexes:   {d}\n", .{info.numberOfIndexes});
-        try writer.print("number of triggers:  {d}\n", .{info.numberOfTriggers});
-        try writer.print("number of views:     {d}\n", .{info.numberOfViews});
-        try writer.print("schema size:         {d}\n", .{info.schemaSize});
+        std.debug.print("database page size:  {d}\n", .{info.databasePageSize});
+        std.debug.print("write format:        {d}\n", .{info.writeFormat});
+        std.debug.print("read format:         {d}\n", .{info.readFormat});
+        std.debug.print("reserved bytes:      {d}\n", .{info.reservedBytes});
+        std.debug.print("file change counter: {d}\n", .{info.fileChangeCounter});
+        std.debug.print("database page count: {d}\n", .{info.databasePageCount});
+        std.debug.print("freelist page count: {d}\n", .{info.freelistPageCount});
+        std.debug.print("schema cookie:       {d}\n", .{info.schemaCookie});
+        std.debug.print("schema format:       {d}\n", .{info.schemaFormat});
+        std.debug.print("default cache size:  {d}\n", .{info.defaultCacheSize});
+        std.debug.print("autovacuum top root: {d}\n", .{info.autovacuumTopRoot});
+        std.debug.print("incremental vacuum:  {d}\n", .{info.incrementalVacuum});
+        std.debug.print("text encoding:       {d}{s}\n", .{ info.textEncoding, encoding_description });
+        std.debug.print("user version:        {d}\n", .{info.userVersion});
+        std.debug.print("application id:      {d}\n", .{info.applicationId});
+        std.debug.print("software version:    {d}\n", .{info.softwareVersion});
+        std.debug.print("number of tables:    {d}\n", .{info.numberOfTables});
+        std.debug.print("number of indexes:   {d}\n", .{info.numberOfIndexes});
+        std.debug.print("number of triggers:  {d}\n", .{info.numberOfTriggers});
+        std.debug.print("number of views:     {d}\n", .{info.numberOfViews});
+        std.debug.print("schema size:         {d}\n", .{info.schemaSize});
     }
 
     pub fn printSchemas(self: *Db) !void {
@@ -279,12 +279,12 @@ pub const Db = struct {
         }
     }
 
-    pub fn printTables(self: *Db, writer: anytype) !void {
+    pub fn printTables(self: *Db) !void {
         const schemas = self.schemas orelse return error.NoTables;
         for (schemas) |schema| {
-            try writer.print("{s} ", .{schema.tableName});
+            std.debug.print("{s} ", .{schema.tableName});
         }
-        try writer.print("{s}", .{"\n"});
+        std.debug.print("\n", .{});
     }
 
     pub fn read_schema(self: *Db) ![]SchemaEntry {
@@ -299,10 +299,10 @@ pub const Db = struct {
     }
 
     pub fn scan_table(self: *Db, root_page: u32) ![]LeafTableCell {
-        var table_data = std.ArrayList(LeafTableCell).init(self.allocator);
-        errdefer table_data.deinit();
+        var table_data = try std.ArrayList(LeafTableCell).initCapacity(self.allocator, 0);
+        errdefer table_data.deinit(self.allocator);
         try self.walk_btree_table_pages(root_page, &table_data);
-        return table_data.toOwnedSlice();
+        return table_data.toOwnedSlice(self.allocator);
     }
 
     fn walk_btree_table_pages(self: *Db, page: u32, table_data: *std.ArrayList(LeafTableCell)) !void {
@@ -314,7 +314,7 @@ pub const Db = struct {
             0x0d => {
                 const records = try self.walk_leaf_page(page_header);
                 for (records) |record| {
-                    try table_data.append(record);
+                    try table_data.append(self.allocator, record);
                 }
             },
             0x02 => {
@@ -330,8 +330,8 @@ pub const Db = struct {
     }
 
     fn walk_leaf_page(self: *Db, page_header: PageHeader) ![]LeafTableCell {
-        var list = std.ArrayList(LeafTableCell).init(self.allocator);
-        defer list.deinit(); // Add defer to prevent memory leaks
+        var list = try std.ArrayList(LeafTableCell).initCapacity(self.allocator, 0);
+        defer list.deinit(self.allocator); // Add defer to prevent memory leaks
 
         if (page_header.page_type != @intFromEnum(PageType.leaf_table)) {
             return error.NotALeafPage;
@@ -351,10 +351,10 @@ pub const Db = struct {
             const row_id = page_header.page[(start - page_offset) + 1];
             const payload_data = page_header.page[(start - page_offset) + 2 .. (end - page_offset) + 2];
             const record = try parseRecord(self.allocator, payload_data, row_id);
-            try list.append(record);
+            try list.append(self.allocator, record);
         }
 
-        return list.toOwnedSlice();
+        return list.toOwnedSlice(self.allocator);
     }
 
     pub fn deinit(self: *Db) void {
@@ -533,15 +533,15 @@ fn parseRecord(allocator: std.mem.Allocator, data: []const u8, row_id: u8) !Leaf
     assert(headerSize >= nr);
     headerSize = headerSize - nr;
     pos += nr;
-    var serialTypes = std.ArrayList(SerialTypeInfo).init(allocator);
-    errdefer serialTypes.deinit();
+    var serialTypes = try std.ArrayList(SerialTypeInfo).initCapacity(allocator, 0);
+    errdefer serialTypes.deinit(allocator);
 
     while (headerSize > 0) {
         const currentPayload = data[pos..];
         const types = try readVarint(currentPayload);
         nr = types.size;
         const serialTypeInfo = try getTypeAndSizeFromSerial(types.value);
-        try serialTypes.append(serialTypeInfo);
+        try serialTypes.append(allocator, serialTypeInfo);
         pos += nr;
         assert(headerSize >= nr);
         headerSize -= nr;

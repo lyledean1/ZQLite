@@ -28,13 +28,13 @@ pub const Parser = struct {
 
    pub fn executeCommand(self: *Parser, command: Token) !void {
       if (std.mem.eql(u8, command.value, ".dbinfo")) {
-         try self.db.printDbInfo(std.io.getStdOut().writer());
+         try self.db.printDbInfo();
       }
       if (std.mem.eql(u8, command.value, ".schema")) {
          try self.db.printSchemas();
       }
       if (std.mem.eql(u8, command.value, ".tables")) {
-         try self.db.printTables(std.io.getStdOut().writer());
+         try self.db.printTables();
       }
    }
 

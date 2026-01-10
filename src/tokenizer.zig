@@ -186,12 +186,12 @@ pub const Tokenizer = struct {
     }
 
     pub fn tokenize(self: *Tokenizer) !ArrayList(Token) {
-        var tokens = ArrayList(Token).init(self.allocator);
-        errdefer tokens.deinit();
+        var tokens = try ArrayList(Token).initCapacity(self.allocator, 0);
+        errdefer tokens.deinit(self.allocator);
 
         while (true) {
             const token = try self.nextToken();
-            try tokens.append(token);
+            try tokens.append(self.allocator, token);
             if (token.type == TokenType.EOF) break;
         }
 
