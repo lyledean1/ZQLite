@@ -85,7 +85,7 @@ const SchemaEntry = struct {
     schemaType: []const u8,
     name: []const u8,
     tableName: []const u8,
-    rootPage: i8,
+    rootPage: i64,  // Can be various int types, use i64 to handle all
     sql: []const u8,
 
     pub fn print(self: SchemaEntry) void {
@@ -125,11 +125,28 @@ const ColumnValue = union(SqliteType) {
     Text: []const u8,
 };
 
+// B-tree seeking support
+pub const SeekMode = enum {
+    Equal,       // WHERE id = 5
+    Range,       // WHERE id >= 10 AND id <= 20
+    GreaterThan, // WHERE id > 100
+    LessThan,    // WHERE id < 50
+    GreaterEqual, // WHERE id >= 100
+    LessEqual,   // WHERE id <= 50
+};
+
+pub const SeekCriteria = struct {
+    mode: SeekMode,
+    key_start: i64,
+    key_end: ?i64 = null,
+};
+
 pub const Db = struct {
     file: std.fs.File,
     allocator: std.mem.Allocator,
     info: ?DbInfo = null,
     schemas: ?[]SchemaEntry = null,
+    debug: bool = false,
 
     pub fn new(filename: []const u8, allocator: std.mem.Allocator) !Db {
         const file = try std.fs.cwd().createFile(
@@ -220,7 +237,7 @@ pub const Db = struct {
         page_header.fragmented_free_bytes = page[7];
         page_header.cell_pointer_array_offset = 8;
         if (page_type == 0x02 or page_type == 0x05) {
-            page_header.right_most_pointer = std.mem.readInt(u16, page[8..12][0..2], .big);
+            page_header.right_most_pointer = std.mem.readInt(u32, page[8..12][0..4], .big);
             page_header.cell_pointer_array_offset += 4;
         }
         page_header.unallocated_region_size = page_header.start_of_cell_content_area - (page_header.cell_pointer_array_offset + (page_header.cell_count * 2));
@@ -289,13 +306,35 @@ pub const Db = struct {
 
     pub fn read_schema(self: *Db) ![]SchemaEntry {
         const records = try self.scan_table(1);
-        var values = try self.allocator.alloc(SchemaEntry, records.len);
-        for (records, 0..) |record, i| {
+        var schema_list = try std.ArrayList(SchemaEntry).initCapacity(self.allocator, records.len);
+        errdefer schema_list.deinit(self.allocator);
+
+        for (records) |record| {
             const value = record.values;
-            const entry = SchemaEntry{ .schemaType = value[0].Text, .name = value[1].Text, .tableName = value[2].Text, .rootPage = value[3].Int8, .sql = value[4].Text };
-            values[i] = entry;
+            // Skip entries with NULL values (like indexes without SQL)
+            if (value[4] == .Null) continue;
+
+            // Extract root page number from various integer types
+            const root_page: i64 = switch (value[3]) {
+                .Int8 => |v| @as(i64, v),
+                .Int16 => |v| @as(i64, v),
+                .Int24 => |v| @as(i64, v),
+                .Int32 => |v| @as(i64, v),
+                .Int48 => |v| @as(i64, v),
+                .Int64 => |v| v,
+                else => return error.InvalidRootPageType,
+            };
+
+            const entry = SchemaEntry{
+                .schemaType = value[0].Text,
+                .name = value[1].Text,
+                .tableName = value[2].Text,
+                .rootPage = root_page,
+                .sql = value[4].Text
+            };
+            try schema_list.append(self.allocator, entry);
         }
-        return values;
+        return schema_list.toOwnedSlice(self.allocator);
     }
 
     pub fn scan_table(self: *Db, root_page: u32) ![]LeafTableCell {
@@ -305,13 +344,23 @@ pub const Db = struct {
         return table_data.toOwnedSlice(self.allocator);
     }
 
+    // B-tree seeking - optimized for WHERE clauses on rowid/PRIMARY KEY
+    pub fn seek_table(self: *Db, root_page: u32, criteria: SeekCriteria) ![]LeafTableCell {
+        var results = try std.ArrayList(LeafTableCell).initCapacity(self.allocator, 0);
+        errdefer results.deinit(self.allocator);
+        try self.seek_btree(root_page, criteria, &results);
+        return results.toOwnedSlice(self.allocator);
+    }
+
     fn walk_btree_table_pages(self: *Db, page: u32, table_data: *std.ArrayList(LeafTableCell)) !void {
         const page_header = try self.get_page(page);
         switch (page_header.page_type) {
             0x05 => {
-                return error.NotImplementedForPageType0x05;
+                // Interior table page - contains pointers to child pages
+                try self.walk_interior_table_page(page_header, table_data);
             },
             0x0d => {
+                // Leaf table page - contains actual data records
                 const records = try self.walk_leaf_page(page_header);
                 for (records) |record| {
                     try table_data.append(self.allocator, record);
@@ -329,6 +378,155 @@ pub const Db = struct {
         }
     }
 
+    fn walk_interior_table_page(self: *Db, page_header: PageHeader, table_data: *std.ArrayList(LeafTableCell)) anyerror!void {
+        // Interior pages have this structure:
+        // - Cell pointer array (each pointing to a cell)
+        // - Each cell contains: left child page number + integer key (divider)
+        // - Right-most pointer at the end
+
+        const page_offset = page_header.page_offset;
+
+        // Walk through each cell and recursively traverse left child pages
+        var cell_index: usize = 0;
+        while (cell_index < page_header.cell_count) : (cell_index += 1) {
+            const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (cell_index * 2);
+            const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
+
+            // Read the left child page number (first 4 bytes of the cell)
+            const left_child_page = std.mem.readInt(u32, page_header.page[(cell_offset - page_offset)..][0..4], .big);
+
+            // Recursively walk the left child page
+            try self.walk_btree_table_pages(left_child_page, table_data);
+        }
+
+        // Don't forget the right-most pointer!
+        // This points to the page containing all keys greater than all dividers
+        try self.walk_btree_table_pages(page_header.right_most_pointer, table_data);
+    }
+
+    // Optimized B-tree seeking - navigates directly to relevant pages
+    fn seek_btree(self: *Db, page_num: u32, criteria: SeekCriteria, results: *std.ArrayList(LeafTableCell)) anyerror!void {
+        const page_header = try self.get_page(page_num);
+
+        if (self.debug) {
+            std.debug.print("[DEBUG] Visiting page {d} (type: 0x{x})\n", .{page_num, page_header.page_type});
+        }
+
+        switch (page_header.page_type) {
+            0x05 => { // Interior page - navigate using divider keys
+                if (self.debug) {
+                    std.debug.print("[DEBUG] Interior page with {d} cells\n", .{page_header.cell_count});
+                }
+                const page_offset = page_header.page_offset;
+
+                // Iterate through cells to find the right path
+                for (0..page_header.cell_count) |i| {
+                    const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (i * 2);
+                    const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
+
+                    // Read left child page number (first 4 bytes)
+                    const left_child_page = std.mem.readInt(u32, page_header.page[(cell_offset - page_offset)..][0..4], .big);
+
+                    // Read divider key (varint after page number)
+                    const key_data = page_header.page[(cell_offset - page_offset + 4)..];
+                    const divider_key_varint = try readVarint(key_data);
+                    const divider_key: i64 = @intCast(divider_key_varint.value);
+
+                    if (self.debug) {
+                        std.debug.print("[DEBUG]   Cell {d}: divider_key={d}, left_child=page {d}\n", .{i, divider_key, left_child_page});
+                    }
+
+                    // Decision: should we traverse this child?
+                    switch (criteria.mode) {
+                        .Equal => {
+                            if (criteria.key_start <= divider_key) {
+                                if (self.debug) {
+                                    std.debug.print("[DEBUG]   → Following left child (seeking {d} <= {d})\n", .{criteria.key_start, divider_key});
+                                }
+                                // Target is in left subtree or exactly at divider
+                                try self.seek_btree(left_child_page, criteria, results);
+                                return; // Found the path, early exit
+                            } else if (self.debug) {
+                                std.debug.print("[DEBUG]   → Skipping left child (seeking {d} > {d})\n", .{criteria.key_start, divider_key});
+                            }
+                        },
+                        .LessThan, .LessEqual => {
+                            if (criteria.key_start <= divider_key) {
+                                // All matching keys are in left subtree
+                                try self.seek_btree(left_child_page, criteria, results);
+                                return;
+                            }
+                        },
+                        .GreaterThan, .GreaterEqual => {
+                            if (criteria.key_start > divider_key) {
+                                // Skip left subtree, continue to next cell
+                                continue;
+                            }
+                            // Some matches might be in left subtree
+                            try self.seek_btree(left_child_page, criteria, results);
+                        },
+                        .Range => {
+                            const end_key = criteria.key_end orelse std.math.maxInt(i64);
+
+                            // Check if range overlaps with left subtree
+                            if (criteria.key_start <= divider_key) {
+                                try self.seek_btree(left_child_page, criteria, results);
+
+                                // If range is fully contained in left subtree
+                                if (end_key <= divider_key) {
+                                    return;
+                                }
+                            }
+                        },
+                    }
+                }
+
+                // Check right-most pointer (contains all keys > all dividers)
+                const should_check_rightmost = switch (criteria.mode) {
+                    .Equal => true, // Might be in right-most
+                    .LessThan, .LessEqual => false, // All less than dividers, already checked
+                    .GreaterThan, .GreaterEqual => true, // Might be in right-most
+                    .Range => true, // Might overlap
+                };
+
+                if (should_check_rightmost) {
+                    try self.seek_btree(page_header.right_most_pointer, criteria, results);
+                }
+            },
+
+            0x0d => { // Leaf page - scan and filter
+                const records = try self.walk_leaf_page(page_header);
+
+                for (records) |record| {
+                    const row_id: i64 = @intCast(record.row_id);
+
+                    const matches = switch (criteria.mode) {
+                        .Equal => row_id == criteria.key_start,
+                        .LessThan => row_id < criteria.key_start,
+                        .GreaterThan => row_id > criteria.key_start,
+                        .LessEqual => row_id <= criteria.key_start,
+                        .GreaterEqual => row_id >= criteria.key_start,
+                        .Range => blk: {
+                            const end_key = criteria.key_end orelse std.math.maxInt(i64);
+                            break :blk row_id >= criteria.key_start and row_id <= end_key;
+                        },
+                    };
+
+                    if (matches) {
+                        try results.append(self.allocator, record);
+
+                        // Early exit for EQUAL mode after finding match
+                        if (criteria.mode == .Equal) {
+                            return;
+                        }
+                    }
+                }
+            },
+
+            else => return error.UnknownPageType,
+        }
+    }
+
     fn walk_leaf_page(self: *Db, page_header: PageHeader) ![]LeafTableCell {
         var list = try std.ArrayList(LeafTableCell).initCapacity(self.allocator, 0);
         defer list.deinit(self.allocator); // Add defer to prevent memory leaks
@@ -342,14 +540,21 @@ pub const Db = struct {
             const page_offset = page_header.page_offset;
             const pointer_offset = (page_header.cell_pointer_array_offset - page_offset) + (cell_index * 2);
             const cell_offset = std.mem.readInt(u16, page_header.page[pointer_offset..][0..2], .big);
-            const stream = std.io.fixedBufferStream(page_header.page[(cell_offset - page_offset)..]);
 
-            const varint_value = try readVarint(page_header.page[(cell_offset - page_offset)..]);
-            const payload_size = varint_value.value;
-            const start = cell_offset + stream.pos;
-            const end = start + @as(usize, @intCast(payload_size));
-            const row_id = page_header.page[(start - page_offset) + 1];
-            const payload_data = page_header.page[(start - page_offset) + 2 .. (end - page_offset) + 2];
+            var cell_data = page_header.page[(cell_offset - page_offset)..];
+
+            // Read payload size (varint)
+            const payload_size_varint = try readVarint(cell_data);
+            const payload_size = payload_size_varint.value;
+            cell_data = cell_data[payload_size_varint.size..];
+
+            // Read row_id (varint)
+            const row_id_varint = try readVarint(cell_data);
+            const row_id = row_id_varint.value;
+            cell_data = cell_data[row_id_varint.size..];
+
+            // Now cell_data points to the actual payload
+            const payload_data = cell_data[0..@intCast(payload_size)];
             const record = try parseRecord(self.allocator, payload_data, row_id);
             try list.append(self.allocator, record);
         }
@@ -403,7 +608,7 @@ fn readDbInfo(db: *Db) !DbInfo {
     return info;
 }
 
-const LeafTableCell = struct {
+pub const LeafTableCell = struct {
     payload_size: u64,
     row_id: u64,
     column_count: u64,
@@ -525,7 +730,7 @@ fn get_max_overload_payload_size(page_type: u32, usable_page_size: u32) !u32 {
     }
 }
 
-fn parseRecord(allocator: std.mem.Allocator, data: []const u8, row_id: u8) !LeafTableCell {
+fn parseRecord(allocator: std.mem.Allocator, data: []const u8, row_id: u64) !LeafTableCell {
     var pos: usize = 0;
     const varintHeader = try readVarint(data);
     var headerSize = varintHeader.value;

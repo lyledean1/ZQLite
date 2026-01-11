@@ -11,15 +11,33 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: {s} <file> <sql> \n", .{args[0]});
+        std.debug.print("Usage: {s} [--debug] <file> [<sql>]\n", .{args[0]});
+        std.debug.print("Options:\n", .{});
+        std.debug.print("  --debug    Enable debug logging (shows query planning and B-tree navigation)\n", .{});
         return;
     }
-    const file = args[1];
+
+    // Parse flags
+    var debug_mode = false;
+    var file_arg_idx: usize = 1;
+
+    // Check for --debug flag
+    if (std.mem.eql(u8, args[1], "--debug")) {
+        debug_mode = true;
+        file_arg_idx = 2;
+        if (args.len < 3) {
+            std.debug.print("Usage: {s} [--debug] <file> [<sql>]\n", .{args[0]});
+            return;
+        }
+    }
+
+    const file = args[file_arg_idx];
     var db = try sql.Db.open(file, allocator);
+    db.debug = debug_mode;
     defer db.deinit();
 
-    if (args.len > 2) {
-        const command = args[2];
+    if (args.len > file_arg_idx + 1) {
+        const command = args[file_arg_idx + 1];
         var tokenizer = Tokenizer.init(command, allocator);
         var tokens = try tokenizer.tokenize();
         defer tokens.deinit(allocator);
